@@ -55,14 +55,23 @@ TOOLS = [
 
 def reply(i, result=None, error=None):
     out = {"jsonrpc":"2.0","id":i,"result":result} if error is None else {"jsonrpc":"2.0","id":i,"error":{"code":-32000,"message":str(error)}}
-    raw = json.dumps(out, separators=(",", ":")); sys.stdout.write(f"Content-Length: {len(raw.encode())}\r\n\r\n{raw}"); sys.stdout.flush()
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n"); sys.stdout.flush()
+
+def read_message(stream):
+    """Read newline-delimited MCP JSON, with compatibility for old framed clients."""
+    line = stream.readline()
+    if not line:
+        return None
+    if line.startswith(b"Content-Length:"):
+        length = int(line.split(b":", 1)[1])
+        stream.readline()
+        return json.loads(stream.read(length))
+    return json.loads(line)
 
 def main():
     while True:
-        line = sys.stdin.buffer.readline()
-        if not line: break
-        if not line.startswith(b"Content-Length:"): continue
-        n = int(line.split(b":",1)[1]); sys.stdin.buffer.readline(); msg=json.loads(sys.stdin.buffer.read(n))
+        msg = read_message(sys.stdin.buffer)
+        if msg is None: break
         method=msg.get("method"); i=msg.get("id")
         try:
             if method == "initialize": reply(i,{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"roblox-playtest-queue","version":"0.1.0"},"instructions":"Use acquire before Roblox Studio playtests and release immediately afterward."})
