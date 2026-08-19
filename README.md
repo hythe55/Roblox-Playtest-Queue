@@ -10,6 +10,8 @@ python server.py
 
 The server exposes `acquire`, `release`, and `renew`. `acquire` waits in FIFO order and returns a lease that lasts 900 seconds by default. Set `ROBLOX_PLAYTEST_QUEUE_DB` for a shared database path and `ROBLOX_PLAYTEST_LEASE_SECONDS` to change the lease length.
 
+On Windows, set `ROBLOX_PLAYTEST_MUTE_AUDIO=true` to mute Roblox Studio's application audio while a lease is active and restore each session's prior mute state on release. Install the optional audio dependencies with `python -m venv .venv` and `.venv\\Scripts\\pip install -r requirements.txt`.
+
 Use a stable `job_id` when retrying an interrupted acquire so the same queue entry is resumed.
 
 ## Claude Code
@@ -17,7 +19,7 @@ Use a stable `job_id` when retrying an interrupted acquire so the same queue ent
 Add the project-scoped server:
 
 ```bash
-claude mcp add --scope project roblox-playtest-queue -- python server.py
+claude mcp add --scope project roblox-playtest-queue -- .venv\\Scripts\\python.exe server.py
 ```
 
 ## Codex

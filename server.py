@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small stdio MCP server that serializes Roblox Studio playtest leases."""
 import json, os, sqlite3, sys, time, uuid
+from audio import mute_studio, restore_studio
 
 DB = os.environ.get("ROBLOX_PLAYTEST_QUEUE_DB", os.path.join(os.path.dirname(__file__), "queue.db"))
 LEASE_SECONDS = int(os.environ.get("ROBLOX_PLAYTEST_LEASE_SECONDS", "900"))
@@ -14,6 +15,9 @@ def db():
 
 def cleanup(c):
     now = time.time()
+    expired = c.execute("SELECT id FROM jobs WHERE state='active' AND lease_until < ?", (now,)).fetchall()
+    if expired:
+        restore_studio()
     c.execute("UPDATE jobs SET state='expired', released=? WHERE state='active' AND lease_until < ?", (now, now))
     c.commit()
 
@@ -34,6 +38,7 @@ def acquire(args):
         if not active and not ahead:
             now = time.time(); until = now + LEASE_SECONDS
             c.execute("UPDATE jobs SET state='active',started=?,lease_until=? WHERE id=? AND state='queued'", (now, until, job_id)); c.commit()
+            mute_studio()
             continue
         time.sleep(2)
 
@@ -43,6 +48,7 @@ def release(args):
     c = db(); now = time.time(); cur = c.execute("UPDATE jobs SET state='released',released=? WHERE id=? AND state='active'", (now, args.get("job_id"))); c.commit()
     if not cur.rowcount:
         raise ValueError("job_id is not an active lease owned by this queue client")
+    restore_studio()
     return {"released": bool(cur.rowcount), "job_id": args.get("job_id")}
 
 def renew(args):
