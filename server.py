@@ -38,10 +38,16 @@ def acquire(args):
         time.sleep(2)
 
 def release(args):
+    if not isinstance(args.get("job_id"), str) or not args["job_id"]:
+        raise ValueError("release requires a non-empty job_id")
     c = db(); now = time.time(); cur = c.execute("UPDATE jobs SET state='released',released=? WHERE id=? AND state='active'", (now, args.get("job_id"))); c.commit()
+    if not cur.rowcount:
+        raise ValueError("job_id is not an active lease owned by this queue client")
     return {"released": bool(cur.rowcount), "job_id": args.get("job_id")}
 
 def renew(args):
+    if not isinstance(args.get("job_id"), str) or not args["job_id"]:
+        raise ValueError("renew requires a non-empty job_id")
     c = db(); now = time.time(); until = now + LEASE_SECONDS
     cur = c.execute("UPDATE jobs SET lease_until=? WHERE id=? AND state='active' AND lease_until >= ?", (until, args.get("job_id"), now)); c.commit()
     if not cur.rowcount: raise ValueError("lease is missing or expired")
@@ -83,5 +89,9 @@ def main():
                 reply(i,{"content":[{"type":"text","text":json.dumps(value)}],"structuredContent":value})
             elif i is not None: reply(i,{})
         except Exception as e:
-            if i is not None: reply(i,error=e)
+            if i is not None:
+                if method == "tools/call":
+                    reply(i,{"isError":True,"content":[{"type":"text","text":f"Playtest queue error: {e}"}]})
+                else:
+                    reply(i,error=e)
 if __name__ == "__main__": main()
