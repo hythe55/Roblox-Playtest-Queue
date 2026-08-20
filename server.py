@@ -92,7 +92,13 @@ def main():
             elif method == "tools/call":
                 name=msg["params"]["name"]; args=msg["params"].get("arguments",{})
                 value = acquire(args) if name=="acquire" else release(args) if name=="release" else renew(args) if name=="renew" else (_ for _ in ()).throw(ValueError("unknown tool"))
-                reply(i,{"content":[{"type":"text","text":json.dumps(value)}],"structuredContent":value})
+                if name == "acquire":
+                    text = f"Playtest lease acquired. job_id={value['job_id']} expires_at={value['expires_at']}"
+                elif name == "release":
+                    text = f"Playtest lease released. job_id={value['job_id']}"
+                else:
+                    text = f"Playtest lease renewed. job_id={value['job_id']} expires_at={value['expires_at']}"
+                reply(i,{"content":[{"type":"text","text":text}]})
             elif i is not None: reply(i,{})
         except Exception as e:
             if i is not None:
