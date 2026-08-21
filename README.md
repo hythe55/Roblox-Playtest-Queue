@@ -8,7 +8,7 @@ An external MCP server that serializes access to a single Roblox Studio playtest
 python server.py
 ```
 
-The server exposes `acquire`, `release`, and `renew`. `acquire` waits in FIFO order and returns a lease that lasts 900 seconds by default. Set `ROBLOX_PLAYTEST_QUEUE_DB` for a shared database path and `ROBLOX_PLAYTEST_LEASE_SECONDS` to change the lease length.
+The server exposes `acquire`, `release`, and `renew`. `acquire` waits in FIFO order and returns a lease that lasts 900 seconds by default. Set `ROBLOX_PLAYTEST_QUEUE_DB` for a shared database path, `ROBLOX_PLAYTEST_LEASE_SECONDS` to change the lease length, or `ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS` to change the maximum age of abandoned queued requests (3600 seconds by default).
 
 On Windows, set `ROBLOX_PLAYTEST_MUTE_AUDIO=true` to mute Roblox Studio's application audio while a lease is active and restore each session's prior mute state on release. Install the optional audio dependencies with `python -m venv .venv` and `.venv\\Scripts\\pip install -r requirements.txt`.
 
