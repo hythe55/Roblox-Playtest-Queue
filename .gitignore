@@ -4,3 +4,4 @@ queue.db
 .venv/
 audio-state.json
 queue.log
+.mcp.json

@@ -5,6 +5,14 @@ PROCESS_NAME = os.environ.get("ROBLOX_PLAYTEST_AUDIO_PROCESS", "RobloxStudioBeta
 _saved = []
 STATE_FILE = os.environ.get("ROBLOX_PLAYTEST_AUDIO_STATE", os.path.join(os.path.dirname(__file__), "audio-state.json"))
 
+def is_muted(volume):
+    value = volume.GetMute
+    return bool(value() if callable(value) else value)
+
+def process_pid(process):
+    value = process.pid
+    return int(value() if callable(value) else value)
+
 def mute_studio(job_id=None):
     global _saved
     if not MUTE_ENABLED:
@@ -17,8 +25,8 @@ def mute_studio(job_id=None):
             process = session.Process
             if process and process.name().lower() == PROCESS_NAME.lower():
                 volume = session.SimpleAudioVolume
-                was_muted = bool(volume.GetMute())
-                pid = int(process.pid())
+                was_muted = is_muted(volume)
+                pid = process_pid(process)
                 _saved.append((volume, was_muted))
                 persisted.append({"pid": pid, "muted": was_muted})
                 volume.SetMute(1, None)
@@ -46,8 +54,8 @@ def restore_studio(job_id=None):
             from pycaw.pycaw import AudioUtilities
             for session in AudioUtilities.GetAllSessions():
                 process = session.Process
-                if process and int(process.pid()) in persisted and process.name().lower() == PROCESS_NAME.lower():
-                    session.SimpleAudioVolume.SetMute(1 if persisted[int(process.pid())] else 0, None)
+                if process and process_pid(process) in persisted and process.name().lower() == PROCESS_NAME.lower():
+                    session.SimpleAudioVolume.SetMute(1 if persisted[process_pid(process)] else 0, None)
                     restored += 1
         except Exception:
             pass
