@@ -12,6 +12,7 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s %
 reply_lock = threading.Lock()
 
 def db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     c = sqlite3.connect(DB, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=30000")
@@ -84,7 +85,7 @@ def renew(args):
     return {"job_id": args.get("job_id"), "expires_at": until, "lease_seconds": LEASE_SECONDS}
 
 TOOLS = [
- {"name":"acquire","description":"This must be called as an awaiting blocking operation. Before calling this tool, clearly tell the user that you are requesting a position in the Roblox Studio playtest queue. Then acquire the exclusive Roblox Studio playtest lease. Call immediately before any Roblox Studio playtest. This waits internally in FIFO order; do not report queue details while waiting. When it returns, proceed normally. Always provide a stable unique job_id and agent name; retry with the same values after a client timeout. Lease lasts 900 seconds.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
+ {"name":"acquire","description":"This must be called as an awaiting blocking operation unless the user explicitly asks to bypass or skip the queue for this playtest; when they do, do not call this tool. Otherwise, before calling this tool, clearly tell the user that you are requesting a position in the Roblox Studio playtest queue, then acquire the exclusive Roblox Studio playtest lease. Call immediately before any Roblox Studio playtest. This waits internally in FIFO order; do not report queue details while waiting. When it returns, proceed normally. Always provide a stable unique job_id and agent name; retry with the same values after a client timeout. Lease lasts 900 seconds.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
  {"name":"release","description":"Release your own lease immediately after your playtest ends, including failures. Provide the same agent and job_id used by acquire.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
  {"name":"renew","description":"Renew your active lease before expiry. Provide the same agent and job_id used by acquire.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}}
 ]
@@ -104,7 +105,7 @@ def read_message(stream):
 def handle(msg):
     method=msg.get("method"); i=msg.get("id")
     try:
-        if method == "initialize": reply(i,{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"roblox-playtest-queue","version":"0.2.0"},"instructions":"Immediately before calling acquire, clearly tell the user that you are requesting a position in the Roblox Studio playtest queue. Call acquire before any Roblox Studio playtest. It waits internally and returns only when ready; do not report queue details while waiting. Use the same agent and job_id for release."})
+        if method == "initialize": reply(i,{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"roblox-playtest-queue","version":"0.2.0"},"instructions":"Unless the user explicitly asks to bypass or skip the queue for a playtest, immediately before calling acquire clearly tell the user that you are requesting a position in the Roblox Studio playtest queue, then call acquire before any Roblox Studio playtest. If the user explicitly asks to bypass or skip the queue, do not call acquire. Acquire waits internally and returns only when ready; do not report queue details while waiting. Use the same agent and job_id for release."})
         elif method == "notifications/initialized": pass
         elif method == "tools/list": reply(i,{"tools":TOOLS})
         elif method == "tools/call":
