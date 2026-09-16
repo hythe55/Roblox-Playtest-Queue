@@ -85,8 +85,13 @@ def renew(args):
     return {"job_id": args.get("job_id"), "expires_at": until, "lease_seconds": LEASE_SECONDS}
 
 TOOLS = [
+<<<<<<< Updated upstream
  {"name":"acquire","description":"This must be called as an awaiting blocking operation unless the user explicitly asks to bypass or skip the queue for this playtest; when they do, do not call this tool. Otherwise, before calling this tool, clearly tell the user that you are requesting a position in the Roblox Studio playtest queue, then acquire the exclusive Roblox Studio playtest lease. Call immediately before any Roblox Studio playtest. This waits internally in FIFO order; do not report queue details while waiting. When it returns, proceed normally. Always provide a stable unique job_id and agent name; retry with the same values after a client timeout. Lease lasts 900 seconds.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
  {"name":"release","description":"Release your own lease immediately after your playtest ends, including failures. Provide the same agent and job_id used by acquire.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
+=======
+ {"name":"acquire","description":"This must be called as an awaiting blocking operation. Before calling this tool, clearly tell the user that you are requesting a position in the Roblox Studio queue. Then acquire the exclusive Roblox Studio lease. Call immediately before any Roblox Studio playtest. You should also request a position in this queue if your work requires work within the edit runtime. This waits internally in FIFO order; do not report queue details while waiting. When it returns, proceed normally. Always provide a stable unique job_id and agent name; retry with the same values after a client timeout. Lease lasts 900 seconds.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
+ {"name":"release","description":"Release your own lease immediately after your playtest or edit-mode required calls end, including failures. Provide the same agent and job_id used by acquire.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}},
+>>>>>>> Stashed changes
  {"name":"renew","description":"Renew your active lease before expiry. Provide the same agent and job_id used by acquire.","inputSchema":{"type":"object","properties":{"agent":{"type":"string"},"job_id":{"type":"string"}},"required":["agent","job_id"]}}
 ]
 
