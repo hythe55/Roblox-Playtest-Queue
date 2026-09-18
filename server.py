@@ -55,7 +55,7 @@ def acquire(args):
                     continue
                 c.commit()
                 audio = mute_studio(job_id)
-                logging.info("audio mute job=%s enabled=%s muted=%s", job_id, audio.get("enabled"), audio.get("muted"))
+                logging.info("audio mute job=%s enabled=%s muted=%s watching=%s", job_id, audio.get("enabled"), audio.get("muted"), audio.get("watching"))
                 if audio.get("warning"):
                     logging.warning("audio mute job=%s warning=%s", job_id, audio["warning"])
                 logging.info("acquire job=%s agent=%s", job_id, agent)
