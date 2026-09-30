@@ -318,12 +318,14 @@ def need_str(args, key, tool):
 
 def parse_scope(v):
     if v is None: return []
-    if isinstance(v, str): v = [v]
+    if isinstance(v, str): v = v.split(",")
     if not isinstance(v, list): raise ValueError("scope must be a list of dotted instance paths")
     out = []
     for s in v:
         if not isinstance(s, str): raise ValueError("scope entries must be strings")
         s = s.strip().strip(".")
+        if s.casefold() == "game": return []  # the whole place
+        if s[:5].casefold() == "game.": s = s[5:].strip(".")  # "game.Workspace.Map" names the same instance as "Workspace.Map"
         if s and s.casefold() not in [o.casefold() for o in out]:
             out.append(s)
     return out
@@ -368,6 +370,15 @@ def granted(c, row, now):
             "expires_at": row["lease_until"], "lease_seconds": row["lease_until"] - now, "text": " ".join(parts)}
 
 
+def _drop_cancelled(agent, job_id):
+    """The caller cancelled this acquire: end its job if it is still queued or active, so no lease waits on nobody."""
+    try:
+        cancel({"agent": agent, "job_id": job_id})
+    except ValueError:
+        pass  # job_id owned by another agent: not ours to end
+    return {"status": "cancelled", "job_id": job_id, "text": f"Cancelled. job_id={job_id}"}
+
+
 def acquire(args, ctx=None):
     agent = need_str(args, "agent", "acquire")
     job_id = need_str(args, "job_id", "acquire")
@@ -388,7 +399,7 @@ def acquire(args, ctx=None):
         first = True
         while True:
             if ctx.cancelled.is_set():
-                return {"status": "cancelled", "job_id": job_id, "text": f"Cancelled. job_id={job_id}"}
+                return _drop_cancelled(agent, job_id)
             cleanup(c)
             ctx.wake.clear()
             events = []; restore = []; result = None; mute = False
@@ -396,6 +407,8 @@ def acquire(args, ctx=None):
                 now = time.time()
                 touch_process(c, now)
                 row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row is not None and row["agent"] != agent:
+                    raise ValueError(f"job_id={job_id} belongs to another agent; use a unique job_id")
                 down = down_flag(c)
                 if down and not (row and row["state"] == "active"):
                     if row and row["state"] == "queued":
@@ -456,6 +469,8 @@ def acquire(args, ctx=None):
                 if audio.get("warning"):
                     logging.warning("audio mute job=%s warning=%s", job_id, audio["warning"])
             flush([e for e in events if e[1].startswith("acquire ")], [])
+            if ctx.cancelled.is_set() and (result is None or result["status"] in ("granted", "queued")):
+                return _drop_cancelled(agent, job_id)  # a cancel raced this poll: nobody is waiting for this job
             if result is not None:
                 return result
             first = False

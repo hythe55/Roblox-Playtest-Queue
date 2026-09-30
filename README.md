@@ -22,7 +22,7 @@ On Windows, set `ROBLOX_PLAYTEST_MUTE_AUDIO=true` to mute Roblox Studio's applic
 
 Reads (search, inspect, script reads) and filesystem script edits need no lease.
 
-An `edit` lease takes `scope`, a list of dotted instance paths such as `["Workspace.Map", "StarterGui.Building"]`. Two scopes conflict when one equals the other or is its ancestor at a dot boundary (`Workspace.Map` conflicts with `Workspace.Map.Tower`, not with `Workspace.MapExtras`). A missing or empty scope means the whole place and conflicts with every edit. Rows from old clients (NULL lane) count as play.
+An `edit` lease takes `scope`, a list of dotted instance paths such as `["Workspace.Map", "StarterGui.Building"]`. Two scopes conflict when one equals the other or is its ancestor at a dot boundary (`Workspace.Map` conflicts with `Workspace.Map.Tower`, not with `Workspace.MapExtras`). A missing or empty scope means the whole place and conflicts with every edit. A leading `game.` is dropped (`game.Workspace.Map` is `Workspace.Map`), `game` alone means the whole place, and a scope given as one string is split on commas. Rows from old clients (NULL lane) count as play.
 
 ### Ordering
 
@@ -36,6 +36,7 @@ While a play request is waiting, `renew` on an edit lease still succeeds but tel
 
 ### Other rules
 
+- A `job_id` belongs to the agent that first used it; `acquire` with another agent's `job_id` is an error, so two agents can never share one lease.
 - One request per agent: a new `acquire` with a different `job_id` supersedes the agent's older queued job. A lease the agent already holds is not touched (the response says so).
 - `cancel` drops a queued job or releases an active one. The server also handles MCP `notifications/cancelled` and cancels the matching in-flight `acquire`.
 - Each process heartbeats every `ROBLOX_PLAYTEST_HEARTBEAT_SECONDS`. Jobs of a process not seen for `ROBLOX_PLAYTEST_PROCESS_TIMEOUT_SECONDS` are expired (audio restored for active ones). On stdin EOF a process releases and cancels its own jobs before exiting.

@@ -330,6 +330,70 @@ class SupersedeCancel(QueueCase):
             server.reply = orig
 
 
+class ReviewFixes(QueueCase):
+    def test_job_id_of_another_agent_is_refused(self):
+        # two agents that pick the same job_id must not both be told they hold Studio
+        self.assertEqual(self.acq("a", "J")["status"], "granted")
+        with self.assertRaisesRegex(ValueError, "another agent"):
+            self.acq("b", "J")
+        self.assertEqual(self.row("J")["agent"], "a")
+        self.assertEqual(self.acq("x", "X")["status"], "queued")
+        with self.assertRaisesRegex(ValueError, "another agent"):
+            self.acq("y", "X")
+        self.assertEqual((self.state("X"), self.row("X")["agent"]), ("queued", "x"))
+
+    def _cancel_during_first_poll(self, msg):
+        """Deliver notifications/cancelled after acquire passed its cancel check but before its first transaction."""
+        orig = server.cleanup
+        fired = []
+
+        def cleanup(c):
+            if not fired:
+                fired.append(1)
+                server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": msg["id"]}})
+            return orig(c)
+        server.cleanup = cleanup
+        return orig
+
+    def test_cancel_racing_first_poll_does_not_leave_a_lease(self):
+        replies = []
+        orig_reply = server.reply
+        server.reply = lambda i, result=None, error=None: replies.append((i, result, error))
+        msg = {"jsonrpc": "2.0", "id": 91, "method": "tools/call",
+               "params": {"name": "acquire", "arguments": {"agent": "b", "job_id": "B"}}}
+        server.register_inflight(msg)
+        orig_cleanup = self._cancel_during_first_poll(msg)
+        try:
+            server.handle(msg)
+        finally:
+            server.cleanup = orig_cleanup; server.reply = orig_reply
+        self.assertEqual(replies, [])
+        self.assertNotIn(self.state("B"), ("active", "queued"))  # nobody is listening for this lease
+        self.assertEqual(self.acq("c", "C")["status"], "granted")
+
+    def test_cancel_racing_first_poll_does_not_leave_a_queued_row(self):
+        self.acq("a", "A")
+        server.MAX_WAIT_SECONDS = 10
+        msg = {"jsonrpc": "2.0", "id": 92, "method": "tools/call",
+               "params": {"name": "acquire", "arguments": {"agent": "b", "job_id": "B"}}}
+        server.register_inflight(msg)
+        orig_reply = server.reply
+        server.reply = lambda *a, **k: None
+        orig_cleanup = self._cancel_during_first_poll(msg)
+        try:
+            Call(server.handle, msg).get()
+        finally:
+            server.cleanup = orig_cleanup; server.reply = orig_reply
+        self.assertNotEqual(self.state("B"), "queued")
+
+    def test_scope_game_prefix_and_comma_string_overlap(self):
+        self.assertEqual(self.acq("a", "A", lane="edit", scope=["game.Workspace.Map"])["status"], "granted")
+        self.assertEqual(self.acq("b", "B", lane="edit", scope=["Workspace.Map.Tower"])["status"], "queued")
+        self.assertEqual(self.acq("c", "C", lane="edit", scope="StarterGui.Building, ReplicatedStorage")["status"], "granted")
+        self.assertEqual(self.acq("d", "D", lane="edit", scope=["ReplicatedStorage.Config"])["status"], "queued")
+        self.assertEqual(server.parse_scope(["game"]), [])  # the whole game means the whole place
+
+
 class Sessions(QueueCase):
     def test_dead_process_cleanup(self):
         now = time.time()
