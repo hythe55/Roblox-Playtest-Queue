@@ -251,14 +251,19 @@ class BoundedWait(QueueCase):
         server.cleanup(self.c)
         self.assertEqual(self.state("B"), "queued")  # nobody polls for B, so nobody gets the lease on its behalf
 
-    def test_queue_age_expiry(self):
+    def test_queue_age_expiry_applies_only_to_old_code_rows(self):
         server.QUEUE_WAIT_SECONDS = 0.2
         self.acq("a", "A")
-        self.acq("b", "B")
+        self.acq("b", "B")  # new-code row: has last_seen
+        self.c.execute("INSERT INTO jobs(id,agent,state,created) VALUES('OLDQ','old','queued',?)", (time.time(),))
         time.sleep(0.4)
+        self.acq("b", "B")  # still polling: never age-expired
         server.cleanup(self.c)
-        self.assertEqual(self.state("B"), "expired")
-        self.assertIn("expire job=B agent=b", self.log())
+        self.assertEqual((self.state("B"), self.state("OLDQ")), ("queued", "expired"))
+        self.assertIn("expire job=OLDQ agent=old", self.log())
+
+    def test_default_live_seconds_is_90(self):
+        self.assertEqual(self._saved["LIVE_SECONDS"], 90)
 
 
 class SupersedeCancel(QueueCase):

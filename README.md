@@ -32,10 +32,11 @@ While a play request is waiting, `renew` on an edit lease still succeeds but tel
 
 ### Bounded waits
 
-`acquire` blocks at most `ROBLOX_PLAYTEST_ACQUIRE_MAX_WAIT_SECONDS` (default 270, chosen so a re-call stays under the 5-minute prompt cache). If it is not granted by then it returns a normal result ("still queued", position, ETA) telling the agent to call again with the same `agent` and `job_id`. The job keeps its place for `ROBLOX_PLAYTEST_GRACE_SECONDS` (default 120); after that it becomes `abandoned`. A job is only ever granted by its own polling thread, so a lease can never go to a request nobody is waiting on.
+`acquire` blocks at most `ROBLOX_PLAYTEST_ACQUIRE_MAX_WAIT_SECONDS` (default 270, chosen so a re-call stays under the 5-minute prompt cache). If it is not granted by then it returns a normal result ("still queued", position, ETA) telling the agent to call again with the same `agent` and `job_id`. The job keeps its place for `ROBLOX_PLAYTEST_GRACE_SECONDS` (default 120); after that it becomes `abandoned`. A job that is still being polled is never expired for age; `ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS` applies only to rows from old-code processes, which have no `last_seen`. A job is only ever granted by its own polling thread, so a lease can never go to a request nobody is waiting on.
 
 ### Other rules
 
+- `agent` must be unique per agent; two agents sharing a name supersede each other's queued requests.
 - A `job_id` belongs to the agent that first used it; `acquire` with another agent's `job_id` is an error, so two agents can never share one lease.
 - One request per agent: a new `acquire` with a different `job_id` supersedes the agent's older queued job. A lease the agent already holds is not touched (the response says so).
 - `cancel` drops a queued job or releases an active one. The server also handles MCP `notifications/cancelled` and cancels the matching in-flight `acquire`.
@@ -70,8 +71,8 @@ The ETA is the sum of the remaining expected minutes of the conflicting leases a
 | `ROBLOX_PLAYTEST_CAMERA_SECONDS` | 120 | Camera lease length (capped at 120) |
 | `ROBLOX_PLAYTEST_ACQUIRE_MAX_WAIT_SECONDS` | 270 | Longest one `acquire` call blocks |
 | `ROBLOX_PLAYTEST_GRACE_SECONDS` | 120 | How long a queued job keeps its place between `acquire` calls |
-| `ROBLOX_PLAYTEST_LIVE_SECONDS` | 30 | A waiter unseen this long no longer holds up others |
-| `ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS` | 3600 | Maximum age of a queued job |
+| `ROBLOX_PLAYTEST_LIVE_SECONDS` | 90 | A waiter unseen this long no longer holds up others |
+| `ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS` | 3600 | Maximum age of a queued job from an old-code process (new-code jobs use the grace period instead) |
 | `ROBLOX_PLAYTEST_POLL_SECONDS` | 2 | Polling interval of a waiting `acquire` |
 | `ROBLOX_PLAYTEST_HEARTBEAT_SECONDS` | 10 | Process heartbeat interval |
 | `ROBLOX_PLAYTEST_PROCESS_TIMEOUT_SECONDS` | 60 | A process unseen this long is dead |

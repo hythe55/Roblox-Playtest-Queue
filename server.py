@@ -24,10 +24,10 @@ DB = os.environ.get("ROBLOX_PLAYTEST_QUEUE_DB", os.path.join(DEFAULT_DB_DIR, "qu
 LOG_FILE = os.environ.get("ROBLOX_PLAYTEST_QUEUE_LOG", os.path.join(os.path.dirname(__file__), "queue.log"))
 LEASE_SECONDS = _env("ROBLOX_PLAYTEST_LEASE_SECONDS", 300)        # play / edit lease and renew length
 CAMERA_SECONDS = _env("ROBLOX_PLAYTEST_CAMERA_SECONDS", 120)      # camera lease, capped at 120, not renewable
-QUEUE_WAIT_SECONDS = _env("ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS", 3600)  # queued jobs older than this expire
+QUEUE_WAIT_SECONDS = _env("ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS", 3600)  # old-code queued jobs older than this expire
 MAX_WAIT_SECONDS = _env("ROBLOX_PLAYTEST_ACQUIRE_MAX_WAIT_SECONDS", 270)  # one acquire call blocks at most this long
 GRACE_SECONDS = _env("ROBLOX_PLAYTEST_GRACE_SECONDS", 120)        # a queued job keeps its place this long between calls
-LIVE_SECONDS = _env("ROBLOX_PLAYTEST_LIVE_SECONDS", 30)           # a waiter unseen this long no longer blocks others
+LIVE_SECONDS = _env("ROBLOX_PLAYTEST_LIVE_SECONDS", 90)          # a waiter unseen this long no longer blocks others
 POLL_SECONDS = _env("ROBLOX_PLAYTEST_POLL_SECONDS", 2)
 HEARTBEAT_SECONDS = _env("ROBLOX_PLAYTEST_HEARTBEAT_SECONDS", 10)
 PROCESS_TIMEOUT_SECONDS = _env("ROBLOX_PLAYTEST_PROCESS_TIMEOUT_SECONDS", 60)
@@ -285,7 +285,8 @@ def cleanup(c):
             c.execute("DELETE FROM processes WHERE id=?", (p["id"],))
         for r in c.execute("SELECT * FROM jobs WHERE state='active' AND lease_until < ?", (now,)).fetchall():
             end_job(r, "expired", now, events, restore, c, "lease-ended", "expire")
-        for r in c.execute("SELECT * FROM jobs WHERE state='queued' AND created < ?", (now - QUEUE_WAIT_SECONDS,)).fetchall():
+        # age expiry only for old-code rows (no last_seen); new-code waiters are governed by grace abandonment
+        for r in c.execute("SELECT * FROM jobs WHERE state='queued' AND last_seen IS NULL AND created < ?", (now - QUEUE_WAIT_SECONDS,)).fetchall():
             end_job(r, "expired", now, events, restore, c, "queue-timeout", "expire")
         for r in c.execute("SELECT * FROM jobs WHERE state='queued' AND last_seen IS NOT NULL AND last_seen < ?",
                            (now - GRACE_SECONDS,)).fetchall():
@@ -395,7 +396,7 @@ def acquire(args, ctx=None):
     c = db()
     try:
         ensure_process(c)
-        deadline = time.time() + MAX_WAIT_SECONDS
+        deadline = time.monotonic() + MAX_WAIT_SECONDS  # in-process only; stored times stay wall clock
         first = True
         while True:
             if ctx.cancelled.is_set():
@@ -455,7 +456,7 @@ def acquire(args, ctx=None):
                             mute = lane_of(row) == "play"
                             result = granted(c, row, now)
                             events.append((logging.INFO, f"acquire job={job_id} agent={agent} {log_fields(row)}"))
-                        elif time.time() >= deadline:
+                        elif time.monotonic() >= deadline:
                             pos, total = position(c, row)
                             eta = fmt_eta(c, row, now)
                             result = {"status": "queued", "job_id": job_id, "position": pos, "queued": total, "eta": eta,
@@ -474,7 +475,7 @@ def acquire(args, ctx=None):
             if result is not None:
                 return result
             first = False
-            ctx.wake.wait(max(0.0, min(POLL_SECONDS, deadline - time.time())) or 0.001)
+            ctx.wake.wait(max(0.0, min(POLL_SECONDS, deadline - time.monotonic())) or 0.001)
     finally:
         if JOB_CTX.get(job_id) is ctx:
             JOB_CTX.pop(job_id, None)
