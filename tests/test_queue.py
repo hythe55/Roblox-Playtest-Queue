@@ -432,12 +432,27 @@ class Sessions(QueueCase):
         self.assertEqual(b.get()["status"], "granted")  # nothing is reserved meanwhile
         c = self.bg("c", "C")
         again = self.bg("a", "A2")
-        self.assertEqual(self.row("A2")["created"], old_created)
+        self.assertEqual(self.row("A2")["created"], self.row("A")["released"])
+        self.assertGreater(self.row("A2")["created"], old_created)
         self.rel("b", "B")
         self.assertEqual(again.get()["status"], "granted")  # front of the queue, ahead of C
         self.assertEqual(self.state("C"), "queued")
         self.rel("a", "A2")
         self.assertEqual(c.get()["status"], "granted")
+
+    def test_rejoin_never_jumps_a_request_that_was_waiting(self):
+        # Two agents alternating play leases with rejoin used to starve a camera request forever.
+        self.acq("a", "A")
+        b = self.bg("b", "B")
+        t = self.bg("t", "T", lane="camera")
+        self.rel("a", "A", rejoin_seconds=60)
+        self.assertEqual(b.get()["status"], "granted")
+        again = self.bg("a", "A2")
+        self.rel("b", "B", rejoin_seconds=60)
+        self.assertEqual(t.get()["status"], "granted")  # T was waiting before A stepped out
+        self.assertEqual(self.state("A2"), "queued")
+        self.rel("t", "T")
+        self.assertEqual(again.get()["status"], "granted")
 
     def test_rejoin_expires_and_is_used_once(self):
         self.acq("a", "A")

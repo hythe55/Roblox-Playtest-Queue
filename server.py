@@ -426,8 +426,10 @@ def acquire(args, ctx=None):
                     created = now
                     rj = c.execute("SELECT * FROM jobs WHERE agent=? AND state='released' AND rejoin_until >= ? "
                                    "ORDER BY released DESC LIMIT 1", (agent, now)).fetchone()
-                    if rj:  # stepped out with rejoin_seconds: take the old queue time (clamped so old code's age expiry keeps it)
-                        created = min(now, max(rj["created"], now - QUEUE_WAIT_SECONDS / 2))
+                    if rj:  # stepped out with rejoin_seconds: queue as of the moment you left, so you go ahead of
+                        # requests made while you were away but never ahead of one that was already waiting.
+                        # Taking the old queue time instead let two agents trading play leases starve a camera request.
+                        created = min(now, max(rj["released"] or now, now - QUEUE_WAIT_SECONDS / 2))
                     c.execute("UPDATE jobs SET rejoin_until=NULL WHERE agent=? AND rejoin_until IS NOT NULL", (agent,))
                     c.execute("INSERT INTO jobs(id,agent,state,created,lane,scope,purpose,minutes,proc,last_seen,queued_at) "
                               "VALUES(?,?, 'queued',?,?,?,?,?,?,?,?)",
