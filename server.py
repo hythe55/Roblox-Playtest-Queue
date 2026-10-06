@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small stdio MCP server that shares one Roblox Studio between agents using lanes.
+"""Small stdio MCP server that shares Roblox Studio between agents using lanes, one queue per place.
 
 Every Claude Code session spawns its own copy of this process; all copies share one
 sqlite database. A job is only ever granted by its own polling thread (inside an
@@ -9,7 +9,7 @@ import json, logging, os, re, sqlite3, sys, threading, time, uuid
 from contextlib import contextmanager
 from audio import mute_studio, restore_studio
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def _env(name, default):
@@ -62,7 +62,7 @@ class Ctx:
 
 NEW_JOB_COLUMNS = [("lane", "TEXT"), ("scope", "TEXT"), ("purpose", "TEXT"), ("minutes", "REAL"),
                    ("proc", "TEXT"), ("last_seen", "REAL"), ("queued_at", "REAL"), ("notes", "TEXT"),
-                   ("rejoin_until", "REAL")]
+                   ("rejoin_until", "REAL"), ("place", "TEXT"), ("place_label", "TEXT")]
 
 
 def migrate(c):
@@ -77,6 +77,12 @@ def migrate(c):
                     raise
     c.execute("CREATE TABLE IF NOT EXISTS processes (id TEXT PRIMARY KEY, pid INTEGER, started REAL, last_seen REAL NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS flags (name TEXT PRIMARY KEY, agent TEXT, reason TEXT, at REAL)")
+    if "place_label" not in {r[1] for r in c.execute("PRAGMA table_info(flags)")}:
+        try:
+            c.execute("ALTER TABLE flags ADD COLUMN place_label TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def db():
@@ -164,6 +170,36 @@ def scope_of(r):
         return []
 
 
+PLACE_RE = re.compile(r"^(?P<name>.*?)\s*\(\s*placeId\s*:\s*(?P<id>\d+)\s*\)\s*$", re.I)
+
+
+def parse_place(v):
+    """The place a job works on, as `(key, label)`; `(None, None)` means no place (conflicts with every place).
+
+    Agents pass the name `list_roblox_studios` gives, e.g. "SD (placeId: 91199332916924)". The key is the placeId, so it
+    survives a Studio restart; a place without one (unsaved, placeId 0) is keyed by its name. The label is kept as given.
+    """
+    if v is None or v == "":
+        return None, None
+    if not isinstance(v, str):
+        raise ValueError("place must be a string: the name list_roblox_studios gives for the Studio you act on")
+    label = one_line(v, 120)
+    if not label:
+        return None, None
+    if label.isdigit():
+        return str(int(label)), label
+    m = PLACE_RE.match(label)
+    if m and int(m["id"]) != 0:
+        return str(int(m["id"])), label
+    name = (m["name"] if m else label).strip()
+    return name.casefold() or label.casefold(), label
+
+
+def same_place(a, b):
+    pa, pb = a["place"], b["place"]
+    return pa is None or pb is None or pa == pb
+
+
 def paths_overlap(a, b):
     a, b = a.casefold(), b.casefold()
     return a == b or b.startswith(a + ".") or a.startswith(b + ".")
@@ -176,6 +212,8 @@ def scopes_overlap(sa, sb):
 
 
 def conflicts(a, b):
+    if not same_place(a, b):
+        return False  # queues are per place; a job with no place is the exception and conflicts with every place
     la, lb = lane_of(a), lane_of(b)
     if la == "play" or lb == "play":
         return True
@@ -228,7 +266,8 @@ def one_line(s, n=120):
 
 
 def log_fields(r):
-    return f"lane={lane_of(r)} scope={fmt_scope(r)} purpose={one_line(r['purpose'], 80) or '-'}"
+    base = f"lane={lane_of(r)} scope={fmt_scope(r)} purpose={one_line(r['purpose'], 80) or '-'}"
+    return base + (f" place={r['place_label']}" if r["place_label"] else "")
 
 
 def fmt_eta(c, row, now):
@@ -245,11 +284,27 @@ def fmt_eta(c, row, now):
 
 
 def position(c, row):
-    q = queued_rows(c)
+    q = [r for r in queued_rows(c) if same_place(r, row)]
     for i, r in enumerate(q):
         if r["id"] == row["id"]:
             return i + 1, len(q)
     return 0, len(q)
+
+
+AUDIO_OWNER = "audio_owner"
+
+
+def other_play_active(c, row_id, now):
+    return any(a["id"] != row_id and lane_of(a) == "play" for a in active_rows(c, now))
+
+
+def release_audio(c, r, now, restore):
+    """Studio audio is muted once for all play leases (it is process-wide). Restore it only when the last one ends."""
+    if other_play_active(c, r["id"], now):
+        return
+    owner = c.execute("SELECT agent FROM flags WHERE name=?", (AUDIO_OWNER,)).fetchone()
+    c.execute("DELETE FROM flags WHERE name=?", (AUDIO_OWNER,))
+    restore.append(owner["agent"] if owner and owner["agent"] else r["id"])  # the job that muted holds the saved state
 
 
 def end_job(r, state, now, events, restore, c, reason, event):
@@ -261,7 +316,7 @@ def end_job(r, state, now, events, restore, c, reason, event):
     if not n:
         return False
     if r["state"] == "active" and lane_of(r) == "play":
-        restore.append(r["id"])
+        release_audio(c, r, now, restore)
     events.append((logging.INFO, f"{event} job={r['id']} agent={r['agent']} {log_fields(r)} was={r['state']} reason={reason}"))
     return True
 
@@ -299,12 +354,17 @@ def wake_all():
         ctx.wake.set()
 
 
-def down_flag(c):
-    return c.execute("SELECT * FROM flags WHERE name='studio_down'").fetchone()
+def down_flag(c, place=None):
+    """The global down flag, else the one for `place` (a place key)."""
+    f = c.execute("SELECT * FROM flags WHERE name='studio_down'").fetchone()
+    if f or place is None:
+        return f
+    return c.execute("SELECT * FROM flags WHERE name=?", ("studio_down:" + place,)).fetchone()
 
 
 def down_text(f):
-    return (f"Studio reported down by {f['agent']} at {time.strftime('%Y-%m-%d %H:%M', time.localtime(f['at']))}: "
+    what = f"Studio place {f['place_label']}" if f["name"] != "studio_down" and f["place_label"] else "Studio"
+    return (f"{what} reported down by {f['agent']} at {time.strftime('%Y-%m-%d %H:%M', time.localtime(f['at']))}: "
             f"{f['reason']}. Stop and tell your orchestrator or user.")
 
 
@@ -354,7 +414,8 @@ def holding_note(c, agent, job_id, now):
 def granted(c, row, now):
     lane = lane_of(row)
     parts = [f"Ready. Use the same agent and job_id={row['id']} when releasing or renewing. "
-             f"lane={lane}{'' if lane != 'edit' else ' scope=' + fmt_scope(row)} lease={row['lease_until'] - now:.0f}s."]
+             f"lane={lane}{'' if lane != 'edit' else ' scope=' + fmt_scope(row)}"
+             f"{' place=' + row['place_label'] if row['place_label'] else ''} lease={row['lease_until'] - now:.0f}s."]
     if lane == "camera":
         parts.append("Camera lease is short and not renewable; release as soon as the capture is done.")
     elif lane == "edit":
@@ -388,6 +449,7 @@ def acquire(args, ctx=None):
     scope = parse_scope(args.get("scope")) if lane == "edit" else []
     purpose = one_line(args.get("purpose")) or None
     minutes = parse_minutes(args.get("minutes"))
+    place_key, place_label = parse_place(args.get("place"))
     ctx = ctx or Ctx()
     ctx.agent, ctx.job_id = agent, job_id
     if ctx.cancelled.is_set():
@@ -410,7 +472,7 @@ def acquire(args, ctx=None):
                 row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if row is not None and row["agent"] != agent:
                     raise ValueError(f"job_id={job_id} belongs to another agent; use a unique job_id")
-                down = down_flag(c)
+                down = down_flag(c, row["place"] if row is not None else place_key)
                 if down and not (row and row["state"] == "active"):
                     if row and row["state"] == "queued":
                         end_job(row, "cancelled", now, events, restore, c, "studio-down", "cancel")
@@ -431,9 +493,10 @@ def acquire(args, ctx=None):
                         # Taking the old queue time instead let two agents trading play leases starve a camera request.
                         created = min(now, max(rj["released"] or now, now - QUEUE_WAIT_SECONDS / 2))
                     c.execute("UPDATE jobs SET rejoin_until=NULL WHERE agent=? AND rejoin_until IS NOT NULL", (agent,))
-                    c.execute("INSERT INTO jobs(id,agent,state,created,lane,scope,purpose,minutes,proc,last_seen,queued_at) "
-                              "VALUES(?,?, 'queued',?,?,?,?,?,?,?,?)",
-                              (job_id, agent, created, lane, json.dumps(scope) if scope else None, purpose, minutes, PROC_ID, now, now))
+                    c.execute("INSERT INTO jobs(id,agent,state,created,lane,scope,purpose,minutes,proc,last_seen,queued_at,place,place_label) "
+                              "VALUES(?,?, 'queued',?,?,?,?,?,?,?,?,?,?)",
+                              (job_id, agent, created, lane, json.dumps(scope) if scope else None, purpose, minutes, PROC_ID, now, now,
+                               place_key, place_label))
                     row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if result is None:
                     st = row["state"]
@@ -455,7 +518,10 @@ def acquire(args, ctx=None):
                             c.execute("UPDATE jobs SET state='active',started=?,lease_until=? WHERE id=? AND state='queued'",
                                       (now, now + secs, job_id))
                             row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-                            mute = lane_of(row) == "play"
+                            mute = lane_of(row) == "play" and not other_play_active(c, job_id, now)
+                            if mute:
+                                c.execute("INSERT INTO flags(name,agent,reason,at) VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                                          "agent=excluded.agent, at=excluded.at", (AUDIO_OWNER, job_id, "audio mute owner", now))
                             result = granted(c, row, now)
                             events.append((logging.INFO, f"acquire job={job_id} agent={agent} {log_fields(row)}"))
                         elif time.monotonic() >= deadline:
@@ -506,7 +572,7 @@ def release(args):
                 raise ValueError("job_id is not an active lease owned by this agent (it may have expired, or been cancelled); nothing to release")
             c.execute("UPDATE jobs SET state='released', released=?, notes=COALESCE(?, notes), rejoin_until=? WHERE id=?",
                       (now, notes, now + rj if rj > 0 else None, job_id))
-            if lane_of(row) == "play": restore.append(job_id)
+            if lane_of(row) == "play": release_audio(c, row, now, restore)
             events.append((logging.INFO, f"release job={job_id} agent={agent} {log_fields(row)}"))
     finally:
         c.close()
@@ -530,7 +596,7 @@ def renew(args):
                 raise ValueError("camera leases are not renewable; release and acquire again")
             waiting = [q for q in queued_rows(c) if is_live(q, now) and conflicts(q, row)]
             if lane == "edit":
-                plays = [q for q in queued_rows(c) if is_live(q, now) and lane_of(q) == "play"]
+                plays = [q for q in queued_rows(c) if is_live(q, now) and lane_of(q) == "play" and same_place(q, row)]
                 if plays:
                     waited = now - (plays[0]["queued_at"] or plays[0]["created"])
                     if waited > LEASE_SECONDS:
@@ -600,14 +666,17 @@ def status(args):
         q = queued_rows(c)
         f = down_flag(c)
         lines = [f"Studio: DOWN, reported by {f['agent']} at {time.strftime('%H:%M', time.localtime(f['at']))}: {f['reason']}" if f else "Studio: up"]
-        lines.append(f"ACTIVE ({len(act)}): agent | lane | scope | purpose | age | expected")
+        for pf in c.execute("SELECT * FROM flags WHERE substr(name,1,12)='studio_down:' ORDER BY at").fetchall():
+            lines.append(f"Place down: {pf['place_label'] or pf['name'][12:]}, reported by {pf['agent']} at "
+                         f"{time.strftime('%H:%M', time.localtime(pf['at']))}: {pf['reason']}")
+        lines.append(f"ACTIVE ({len(act)}): place | agent | lane | scope | purpose | age | expected")
         for r in act:
             exp = f"{r['minutes']:g}m" if r["minutes"] else "?"
-            lines.append(f"  {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['started'] or now))} | {exp}")
-        lines.append(f"QUEUED ({len(q)}): # | agent | lane | scope | purpose | waited")
-        for i, r in enumerate(q):
+            lines.append(f"  {r['place_label'] or '-'} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['started'] or now))} | {exp}")
+        lines.append(f"QUEUED ({len(q)}): # | place | agent | lane | scope | purpose | waited")
+        for r in q:
             away = "" if is_live(r, now) else " (away)"
-            lines.append(f"  {i + 1} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['queued_at'] or r['created']))}{away}")
+            lines.append(f"  {position(c, r)[0]} | {r['place_label'] or '-'} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['queued_at'] or r['created']))}{away}")
         jid = args.get("job_id")
         if isinstance(jid, str) and jid:
             r = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
@@ -628,37 +697,47 @@ def status(args):
 def report_down(args):
     agent = need_str(args, "agent", "report_down")
     reason = one_line(args.get("reason"), 300) or "no reason given"
+    key, label = parse_place(args.get("place"))
     c = db()
     try:
         with txn(c):
-            c.execute("INSERT INTO flags(name,agent,reason,at) VALUES('studio_down',?,?,?) "
-                      "ON CONFLICT(name) DO UPDATE SET agent=excluded.agent, reason=excluded.reason, at=excluded.at", (agent, reason, time.time()))
+            c.execute("INSERT INTO flags(name,agent,reason,at,place_label) VALUES(?,?,?,?,?) "
+                      "ON CONFLICT(name) DO UPDATE SET agent=excluded.agent, reason=excluded.reason, at=excluded.at, "
+                      "place_label=excluded.place_label",
+                      ("studio_down" if key is None else "studio_down:" + key, agent, reason, time.time(), label))
     finally:
         c.close()
-    logging.warning("studio down by=%s reason=%s", agent, reason)
+    logging.warning("studio down by=%s reason=%s%s", agent, reason, f" place={label}" if label else "")
     wake_all()
-    return {"text": "Studio marked down. Every acquire returns immediately until someone calls report_up. Stop and tell your orchestrator or user."}
+    if key is None:
+        return {"text": "Studio marked down. Every acquire returns immediately until someone calls report_up. Stop and tell your orchestrator or user."}
+    return {"text": (f"Studio place {label} marked down. Every acquire for that place returns immediately until someone calls report_up "
+                     "with the same place; other places are unaffected. Stop work on that place and tell your orchestrator or user.")}
 
 
 def report_up(args):
     agent = need_str(args, "agent", "report_up")
+    key, label = parse_place(args.get("place"))
     c = db()
     try:
         with txn(c):
-            had = c.execute("DELETE FROM flags WHERE name='studio_down'").rowcount
+            had = c.execute("DELETE FROM flags WHERE name=?", ("studio_down" if key is None else "studio_down:" + key,)).rowcount
     finally:
         c.close()
-    logging.info("studio up by=%s was_down=%s", agent, bool(had))
-    return {"text": "Studio marked up." if had else "Studio was not marked down."}
+    logging.info("studio up by=%s was_down=%s%s", agent, bool(had), f" place={label}" if label else "")
+    what = "Studio" if key is None else f"Studio place {label}"
+    return {"text": f"{what} marked up." if had else f"{what} was not marked down."}
 
 
 # ---------------------------------------------------------------- MCP plumbing
 
+PLACE = {"type": "string", "description": "The Studio place, exactly as list_roblox_studios names it. Omit for every place."}
 JOB = {"agent": {"type": "string", "description": "Your stable agent name."},
        "job_id": {"type": "string", "description": "Stable id for this request; reuse it for every call about it."}}
 TOOLS = [
- {"name": "acquire", "description": "Get a lease before any blocking Studio action: Play mode, screenshots, camera/input (lane play, default, exclusive); MCP edits to instances (lane edit, concurrent with other edits unless scopes overlap); or a short screenshot/viewport change during edit work (lane camera, max 120 s). Reads (search, inspect, script reads) and filesystem script edits need no lease. Unless the user asks to bypass the queue, tell the user you are requesting a queue position first. Waits up to ~4.5 min; if it says 'still queued', call again at once with the same agent and job_id. Lease is 300 s; renew, release when done.",
+ {"name": "acquire", "description": "Get a lease before any blocking Studio action: Play mode, screenshots, camera/input (lane play, default, exclusive); MCP edits to instances (lane edit, concurrent with other edits unless scopes overlap); or a short screenshot/viewport change during edit work (lane camera, max 120 s). Reads (search, inspect, script reads) and filesystem script edits need no lease. Queues are per Studio place: pass `place` exactly as list_roblox_studios names the Studio you will act on (e.g. 'SD (placeId: 91199332916924)'); jobs for different places never wait for each other, and a job without `place` waits for every place. Unless the user asks to bypass the queue, tell the user you are requesting a queue position first. Waits up to ~4.5 min; if it says 'still queued', call again at once with the same agent and job_id. Lease is 300 s; renew, release when done.",
   "inputSchema": {"type": "object", "properties": {**JOB,
+     "place": {"type": "string", "description": "The Studio place you act on, exactly as list_roblox_studios names it, e.g. \"SD (placeId: 91199332916924)\". Each place has its own queue."},
      "lane": {"type": "string", "enum": list(LANES), "description": "play (default), edit or camera."},
      "scope": {"type": "array", "items": {"type": "string"}, "description": "edit lane: dotted instance paths you will change, e.g. [\"Workspace.Map\",\"StarterGui.Building\"]. Empty means the whole place."},
      "purpose": {"type": "string", "description": "Short reason, shown to others."},
@@ -671,12 +750,12 @@ TOOLS = [
   "inputSchema": {"type": "object", "properties": JOB, "required": ["agent", "job_id"]}},
  {"name": "cancel", "description": "Drop your queued request, or release it if active. Use when you no longer need it (plan changed, giving up).",
   "inputSchema": {"type": "object", "properties": JOB, "required": ["agent", "job_id"]}},
- {"name": "status", "description": "Show who holds Studio (lane, scope, purpose, age), the queue, and an ETA for your job_id if given. No lease needed.",
+ {"name": "status", "description": "Show who holds Studio in each place (lane, scope, purpose, age), the queues, and an ETA for your job_id if given. No lease needed.",
   "inputSchema": {"type": "object", "properties": {"job_id": JOB["job_id"]}}},
- {"name": "report_down", "description": "Call when Studio or its MCP is disconnected or unusable. Makes every acquire return at once telling agents to stop. Do not keep retrying.",
-  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "reason": {"type": "string"}}, "required": ["agent", "reason"]}},
- {"name": "report_up", "description": "Clear the Studio-down flag once Studio is working again.",
-  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"]}, "required": ["agent"]}},
+ {"name": "report_down", "description": "Call when Studio or its MCP is disconnected or unusable. Makes every acquire (for `place` when given, else for every place) return at once telling agents to stop. Do not keep retrying.",
+  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "reason": {"type": "string"}, "place": PLACE}, "required": ["agent", "reason"]}},
+ {"name": "report_up", "description": "Clear the Studio-down flag once Studio is working again; pass the same `place` you gave report_down.",
+  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "place": PLACE}, "required": ["agent"]}},
 ]
 HANDLERS = {"release": release, "renew": renew, "cancel": cancel, "status": status,
             "report_down": report_down, "report_up": report_up}
@@ -688,6 +767,9 @@ INSTRUCTIONS = (
     "Lanes: play (default, exclusive) for Play mode, screenshots, camera and input; edit for MCP edits to edit-time instances, "
     "pass scope = the dotted paths you change (edits with disjoint scopes run together); camera (max 120 s) for a screenshot "
     "or viewport change during edit work. Reads (search, inspect, script reads) and filesystem script edits need no lease. "
+    "Queues are per place: call list_roblox_studios and pass place = the exact name listed for the Studio you act on, in acquire "
+    "(and in report_down/report_up when only that place is down); jobs for different places never wait for each other, "
+    "and a job without place waits for every place. "
     "Give purpose and minutes. Use the same agent and job_id for acquire, renew, release and cancel. "
     "If acquire says 'still queued' it is not an error: call it again at once with the same values. "
     "Do not hold a lease while coding between runs: release (rejoin_seconds keeps your place) and acquire again. "

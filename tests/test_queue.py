@@ -518,6 +518,109 @@ class Visibility(QueueCase):
         self.assertRegex(log, r"INFO release job=J1 agent=agent-x lane=edit scope=Workspace\.Map purpose=fix walls")
 
 
+class Places(QueueCase):
+    SD = "SD (placeId: 91199332916924)"
+    HO = "Hotel Oddities (placeId: 1234)"
+
+    def test_parse_place(self):
+        self.assertEqual(server.parse_place(self.SD), ("91199332916924", self.SD))
+        self.assertEqual(server.parse_place("91199332916924"), ("91199332916924", "91199332916924"))
+        self.assertEqual(server.parse_place("SD renamed (placeId: 91199332916924)")[0], "91199332916924")  # the id is the key, not the name
+        self.assertEqual(server.parse_place("Place1 (placeId: 0)")[0], "place1")  # unsaved place: keyed by name
+        self.assertEqual(server.parse_place("My Game.rbxl")[0], "my game.rbxl")
+        self.assertEqual(server.parse_place(None), (None, None))
+        self.assertEqual(server.parse_place("   "), (None, None))
+        with self.assertRaises(ValueError):
+            server.parse_place(5)
+
+    def test_places_do_not_block_each_other(self):
+        self.assertEqual(self.acq("a", "A", place=self.SD)["status"], "granted")
+        self.assertEqual(self.acq("b", "B", place=self.HO)["status"], "granted")  # play lanes, different places
+        self.assertEqual(self.acq("c", "C", place=self.SD)["status"], "queued")  # same place as A
+
+    def test_same_place_by_id_even_when_the_name_text_differs(self):
+        self.acq("a", "A", place=self.SD)
+        self.assertEqual(self.acq("b", "B", place="SD renamed (placeId: 91199332916924)")["status"], "queued")
+
+    def test_job_without_place_conflicts_with_every_place(self):
+        self.acq("a", "A", place=self.SD)
+        self.assertEqual(self.acq("b", "B")["status"], "queued")  # no place waits for every place
+        self.rel("a", "A")
+        self.assertEqual(self.acq("b", "B")["status"], "granted")
+        self.assertEqual(self.acq("c", "C", place=self.HO)["status"], "queued")  # and every place waits for it
+
+    def test_edits_in_different_places_never_overlap(self):
+        self.acq("a", "A", lane="edit", scope=["Workspace.Map"], place=self.SD)
+        self.assertEqual(self.acq("b", "B", lane="edit", scope=["Workspace.Map"], place=self.HO)["status"], "granted")
+        self.assertEqual(self.acq("c", "C", lane="edit", scope=["Workspace.Map"], place=self.SD)["status"], "queued")
+
+    def test_queue_positions_and_status_are_per_place(self):
+        self.acq("a", "A", place=self.SD)
+        self.acq("b", "B", place=self.HO)
+        self.acq("c", "C", place=self.SD)  # queued behind A
+        self.acq("d", "D", place=self.HO)  # queued behind B
+        text = server.status({"job_id": "D"})["text"]
+        self.assertIn("ACTIVE (2): place | agent | lane | scope | purpose | age | expected", text)
+        self.assertIn("QUEUED (2): # | place | agent | lane | scope | purpose | waited", text)
+        self.assertRegex(text, r"  1 \| SD \(placeId: 91199332916924\) \| c \| play")
+        self.assertRegex(text, r"  1 \| Hotel Oddities \(placeId: 1234\) \| d \| play")
+        self.assertIn("Your job D: position 1 of 1", text)
+
+    def test_status_shows_a_dash_for_no_place(self):
+        self.acq("a", "A")
+        self.assertRegex(server.status({})["text"], r"  - \| a \| play")
+
+    def test_acquire_text_and_log_name_the_place(self):
+        r = self.acq("a", "A", lane="edit", scope=["Workspace.Map"], place=self.SD)
+        self.assertIn("place=" + self.SD, r["text"])
+        self.assertRegex(self.log(), r"INFO acquire job=A agent=a lane=edit scope=Workspace\.Map purpose=- place=SD \(placeId: 91199332916924\)")
+
+    def test_edit_renew_yields_only_to_a_play_request_in_its_own_place(self):
+        self.acq("a", "A", lane="edit", scope=["Workspace"], place=self.SD)
+        self.acq("h", "H", place=self.HO)  # holds play in the other place
+        self.acq("q", "Q", place=self.HO)  # a play request waiting there
+        self.assertFalse(server.renew({"agent": "a", "job_id": "A"})["yield"])
+        self.acq("s", "S", place=self.SD)  # a play request waiting behind A
+        self.assertTrue(server.renew({"agent": "a", "job_id": "A"})["yield"])
+
+    def test_down_can_be_one_place_or_all(self):
+        server.report_down({"agent": "x", "reason": "crashed", "place": self.SD})
+        r = self.acq("a", "A", place=self.SD)
+        self.assertEqual(r["status"], "down")
+        self.assertIn("Studio place " + self.SD + " reported down by x", r["text"])
+        self.assertEqual(self.acq("b", "B", place=self.HO)["status"], "granted")  # other places keep working
+        text = server.status({})["text"]
+        self.assertIn("Studio: up", text)
+        self.assertIn("Place down: " + self.SD + ", reported by x at", text)
+        server.report_up({"agent": "x"})  # no place clears only the global flag
+        self.assertEqual(self.acq("a2", "A2", place=self.SD)["status"], "down")
+        self.assertIn("marked up", server.report_up({"agent": "x", "place": self.SD})["text"])
+        self.rel("b", "B")
+        self.assertEqual(self.acq("a3", "A3", place=self.SD)["status"], "granted")
+        server.report_down({"agent": "x", "reason": "all gone"})  # no place: every place
+        self.assertEqual(self.acq("b4", "B4", place=self.HO)["status"], "down")
+
+    def test_place_down_wakes_a_waiter_in_that_place_only(self):
+        self.acq("a", "A", place=self.SD)
+        waiter = self.bg("b", "B", place=self.SD)
+        server.report_down({"agent": "x", "reason": "crashed", "place": self.SD})
+        self.assertEqual(waiter.get()["status"], "down")
+
+    def test_audio_is_muted_once_and_restored_by_the_last_play_lease(self):
+        calls = []
+        original = (server.mute_studio, server.restore_studio)
+        server.mute_studio = lambda job_id=None: calls.append(("mute", job_id)) or {"enabled": True}
+        server.restore_studio = lambda job_id=None: calls.append(("restore", job_id)) or {}
+        self.addCleanup(lambda: (setattr(server, "mute_studio", original[0]), setattr(server, "restore_studio", original[1])))
+        self.acq("a", "A", place=self.SD)
+        self.acq("b", "B", place=self.HO)
+        self.assertEqual(calls, [("mute", "A")])  # one mute for both play leases
+        self.rel("a", "A")
+        self.assertEqual(calls, [("mute", "A")])  # B still plays: nothing restored yet
+        self.rel("b", "B")
+        self.assertEqual(calls, [("mute", "A"), ("restore", "A")])  # the job that muted holds the saved state
+
+
 class Migration(unittest.TestCase):
     def test_old_schema_db_migrates_additively(self):
         path = os.path.join(TMP, "old-schema.db")
@@ -579,7 +682,7 @@ class EndToEnd(unittest.TestCase):
 
         try:
             init = rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
-            self.assertEqual(init["serverInfo"]["version"], "0.3.0")
+            self.assertEqual(init["serverInfo"]["version"], "0.4.0")
             self.assertIn("requesting a position in the Roblox Studio queue", init["instructions"])
             p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); p.stdin.flush()
             names = [t["name"] for t in rpc("tools/list")["tools"]]

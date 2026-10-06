@@ -1,6 +1,6 @@
 ﻿# Roblox Playtest Queue
 
-An external MCP server (version 0.3.0) that shares one Roblox Studio between several agents. It does not modify or depend on the Roblox Studio MCP.
+An external MCP server (version 0.4.0) that shares Roblox Studio between several agents, with one queue per place. It does not modify or depend on the Roblox Studio MCP.
 
 Every Claude Code session spawns its own `server.py`; all of them share one sqlite database (`%LOCALAPPDATA%\RobloxPlaytestQueue\queue.db`). Subagents of one session share that session's process.
 
@@ -16,13 +16,23 @@ On Windows, set `ROBLOX_PLAYTEST_MUTE_AUDIO=true` to mute Roblox Studio's applic
 
 | Lane | Use for | Concurrency |
 | --- | --- | --- |
-| `play` (default) | Play mode, screenshots, camera, input | Exclusive against everything |
+| `play` (default) | Play mode, screenshots, camera, input | Exclusive within its place |
 | `edit` | MCP edits to edit-time instances | Runs alongside other edits unless their `scope` overlaps |
 | `camera` | A screenshot or viewport change during edit work | One at a time; max 120 s; not renewable; compatible with edit, blocked by play |
 
 Reads (search, inspect, script reads) and filesystem script edits need no lease.
 
 An `edit` lease takes `scope`, a list of dotted instance paths such as `["Workspace.Map", "StarterGui.Building"]`. Two scopes conflict when one equals the other or is its ancestor at a dot boundary (`Workspace.Map` conflicts with `Workspace.Map.Tower`, not with `Workspace.MapExtras`). A missing or empty scope means the whole place and conflicts with every edit. A leading `game.` is dropped (`game.Workspace.Map` is `Workspace.Map`), `game` alone means the whole place, and a scope given as one string is split on commas. Rows from old clients (NULL lane) count as play.
+
+### Places
+
+Each place has its own queue. Agents pass `place` to `acquire` exactly as `list_roblox_studios` names the Studio they act on, for example `SD (placeId: 91199332916924)`. Jobs for different places never wait for each other, so a playtest in one place runs alongside a playtest in another.
+
+- The key is the placeId, so a place keeps its queue across Studio restarts, and two Studio windows on one place share it. A place without a placeId (unsaved, or placeId 0) is keyed by its name. A bare number is accepted as a placeId.
+- A job with no `place` still works: it conflicts with every place, and every place waits for it. Old clients and old rows (NULL place) behave this way.
+- `report_down` and `report_up` take an optional `place`. With one, only that place is marked down; without, every place is, as before.
+- Studio audio muting is process-wide, so it is muted once for all concurrent play leases and restored when the last one ends.
+- `status` lists every place with a `place` column, and queue positions count within a place.
 
 ### Ordering
 
@@ -49,15 +59,15 @@ While a play request is waiting, `renew` on an edit lease still succeeds but tel
 
 | Tool | Signature |
 | --- | --- |
-| `acquire` | `acquire(agent, job_id, lane?, scope?, purpose?, minutes?)` |
+| `acquire` | `acquire(agent, job_id, place?, lane?, scope?, purpose?, minutes?)` |
 | `release` | `release(agent, job_id, notes?, rejoin_seconds?)` |
 | `renew` | `renew(agent, job_id)` (+300 s; reports when over 150% of the estimate) |
 | `cancel` | `cancel(agent, job_id)` |
 | `status` | `status(job_id?)` compact table of active leases and the queue, ETA for `job_id` |
-| `report_down` | `report_down(agent, reason)` |
-| `report_up` | `report_up(agent)` |
+| `report_down` | `report_down(agent, reason, place?)` |
+| `report_up` | `report_up(agent, place?)` |
 
-Old calls `acquire(agent, job_id)` keep working (play lane). Use a stable `job_id`; re-call with the same values when `acquire` says it is still queued.
+Old calls `acquire(agent, job_id)` keep working (play lane, no place). Use a stable `job_id`; re-call with the same values when `acquire` says it is still queued.
 
 The ETA is the sum of the remaining expected minutes of the conflicting leases and waiters ahead; it is "unknown" when any of them gave no `minutes`.
 
@@ -88,7 +98,7 @@ The prefixes `INFO acquire job=... agent=...` and `INFO release job=... agent=..
 
 ## Database
 
-Schema changes are additive only (new columns via `ALTER TABLE ADD COLUMN` guarded by `PRAGMA table_info`, new tables `processes` and `flags`), so old and new processes can share one database. Old rows stay valid. Old processes treat every lease as exclusive, which is safe. Jobs owned by old processes (no `proc`) are never ended with states they do not know.
+Schema changes are additive only (new columns via `ALTER TABLE ADD COLUMN` guarded by `PRAGMA table_info`, among them `jobs.place` and `jobs.place_label`, new tables `processes` and `flags`), so old and new processes can share one database. Old rows stay valid. Old processes treat every lease as exclusive, which is safe. Jobs owned by old processes (no `proc`) are never ended with states they do not know.
 
 ## Manual client
 
