@@ -566,6 +566,26 @@ class Places(QueueCase):
         self.assertRegex(text, r"  1 \| Hotel Oddities \(placeId: 1234\) \| d \| play")
         self.assertIn("Your job D: position 1 of 1", text)
 
+    def test_status_json_has_exact_times_and_places(self):
+        self.acq("a", "A", place=self.SD, lane="edit", scope=["Workspace.Map"], purpose="Rig | scene", minutes=5)
+        self.acq("b", "B", place=self.SD, lane="edit", scope=["Workspace.Map"], purpose="Waits")
+        server.report_down({"agent": "x", "reason": "crashed", "place": self.HO})
+        before = time.time()
+        data = json.loads(server.status({"format": "json"})["text"])
+        self.assertLessEqual(before, data["now"] + 1)
+        self.assertIsNone(data["down"])
+        self.assertEqual(data["placeDown"][0]["place"], self.HO)
+        self.assertEqual(data["placeDown"][0]["reason"], "crashed")
+        a = data["active"][0]
+        self.assertEqual((a["place"], a["agent"], a["lane"], a["scope"], a["purpose"], a["minutes"]),
+                         (self.SD, "a", "edit", "Workspace.Map", "Rig | scene", 5))
+        self.assertAlmostEqual(a["started"], self.row("A")["started"], places=3)  # an exact epoch, not "3m"
+        self.assertAlmostEqual(a["leaseUntil"], self.row("A")["lease_until"], places=3)
+        w = data["queued"][0]
+        self.assertEqual((w["position"], w["place"], w["agent"], w["isAway"]), (1, self.SD, "b", False))
+        self.assertAlmostEqual(w["queued"], self.row("B")["queued_at"], places=3)
+        self.assertIn("ACTIVE (1)", server.status({})["text"])  # the text table is unchanged
+
     def test_status_shows_a_dash_for_no_place(self):
         self.acq("a", "A")
         self.assertRegex(server.status({})["text"], r"  - \| a \| play")

@@ -657,6 +657,26 @@ def shutdown_process():
 
 # ---------------------------------------------------------------- status / studio down
 
+def status_data(c, act, q, now):
+    """The same picture as the status table, with exact epoch times, for clients that draw their own clock."""
+    def when(ts):
+        return time.strftime("%H:%M", time.localtime(ts))
+    f = down_flag(c)
+    place_down = c.execute("SELECT * FROM flags WHERE substr(name,1,12)='studio_down:' ORDER BY at").fetchall()
+    return {
+        "now": now,
+        "down": {"agent": f["agent"], "at": when(f["at"]), "reason": f["reason"]} if f else None,
+        "placeDown": [{"place": pf["place_label"] or pf["name"][12:], "agent": pf["agent"], "at": when(pf["at"]),
+                       "reason": pf["reason"]} for pf in place_down],
+        "active": [{"place": r["place_label"], "agent": r["agent"], "lane": lane_of(r), "scope": fmt_scope(r),
+                    "purpose": one_line(r["purpose"], 50) or None, "started": r["started"] or now,
+                    "minutes": r["minutes"], "leaseUntil": r["lease_until"]} for r in act],
+        "queued": [{"position": position(c, r)[0], "place": r["place_label"], "agent": r["agent"], "lane": lane_of(r),
+                    "scope": fmt_scope(r), "purpose": one_line(r["purpose"], 50) or None,
+                    "queued": r["queued_at"] or r["created"], "isAway": not is_live(r, now), "minutes": r["minutes"]} for r in q],
+    }
+
+
 def status(args):
     c = db()
     try:
@@ -664,6 +684,8 @@ def status(args):
         now = time.time()
         act = sorted(active_rows(c, now), key=lambda r: r["started"] or 0)
         q = queued_rows(c)
+        if args.get("format") == "json":
+            return {"text": json.dumps(status_data(c, act, q, now), separators=(",", ":"))}
         f = down_flag(c)
         lines = [f"Studio: DOWN, reported by {f['agent']} at {time.strftime('%H:%M', time.localtime(f['at']))}: {f['reason']}" if f else "Studio: up"]
         for pf in c.execute("SELECT * FROM flags WHERE substr(name,1,12)='studio_down:' ORDER BY at").fetchall():
@@ -750,8 +772,8 @@ TOOLS = [
   "inputSchema": {"type": "object", "properties": JOB, "required": ["agent", "job_id"]}},
  {"name": "cancel", "description": "Drop your queued request, or release it if active. Use when you no longer need it (plan changed, giving up).",
   "inputSchema": {"type": "object", "properties": JOB, "required": ["agent", "job_id"]}},
- {"name": "status", "description": "Show who holds Studio in each place (lane, scope, purpose, age), the queues, and an ETA for your job_id if given. No lease needed.",
-  "inputSchema": {"type": "object", "properties": {"job_id": JOB["job_id"]}}},
+ {"name": "status", "description": "Show who holds Studio in each place (lane, scope, purpose, age), the queues, and an ETA for your job_id if given. No lease needed. format 'json' returns the same data as JSON with exact epoch times, for tools that draw their own clock.",
+  "inputSchema": {"type": "object", "properties": {"job_id": JOB["job_id"], "format": {"type": "string", "enum": ["text", "json"], "description": "text (default) or json."}}}},
  {"name": "report_down", "description": "Call when Studio or its MCP is disconnected or unusable. Makes every acquire (for `place` when given, else for every place) return at once telling agents to stop. Do not keep retrying.",
   "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "reason": {"type": "string"}, "place": PLACE}, "required": ["agent", "reason"]}},
  {"name": "report_up", "description": "Clear the Studio-down flag once Studio is working again; pass the same `place` you gave report_down.",
