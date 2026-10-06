@@ -683,7 +683,8 @@ HANDLERS = {"release": release, "renew": renew, "cancel": cancel, "status": stat
 
 INSTRUCTIONS = (
     "Unless the user explicitly asks to bypass or skip the queue, immediately before calling acquire clearly tell the user "
-    "that you are requesting a position in the Roblox Studio playtest queue. "
+    "that you are requesting a position in the Roblox Studio queue. "
+    "The queue covers every blocking Studio action, not only playtests; if you are unsure whether an action blocks Studio, acquire first. "
     "Lanes: play (default, exclusive) for Play mode, screenshots, camera and input; edit for MCP edits to edit-time instances, "
     "pass scope = the dotted paths you change (edits with disjoint scopes run together); camera (max 120 s) for a screenshot "
     "or viewport change during edit work. Reads (search, inspect, script reads) and filesystem script edits need no lease. "
@@ -753,7 +754,7 @@ def handle(msg):
     except Exception as e:
         logging.exception("request failed method=%s", method)
         if i is not None and not (ctx is not None and ctx.silent):
-            if method == "tools/call": reply(i, {"isError": True, "content": [{"type": "text", "text": f"Playtest queue error: {e}"}]})
+            if method == "tools/call": reply(i, {"isError": True, "content": [{"type": "text", "text": f"Studio queue error: {e}"}]})
             else: reply(i, error=e)
     finally:
         if method == "tools/call" and i is not None: INFLIGHT.pop(i, None)

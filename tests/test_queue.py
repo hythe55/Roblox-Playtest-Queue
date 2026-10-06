@@ -580,7 +580,7 @@ class EndToEnd(unittest.TestCase):
         try:
             init = rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
             self.assertEqual(init["serverInfo"]["version"], "0.3.0")
-            self.assertIn("requesting a position in the Roblox Studio playtest queue", init["instructions"])
+            self.assertIn("requesting a position in the Roblox Studio queue", init["instructions"])
             p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); p.stdin.flush()
             names = [t["name"] for t in rpc("tools/list")["tools"]]
             self.assertEqual(names, ["acquire", "release", "renew", "cancel", "status", "report_down", "report_up"])
