@@ -657,6 +657,9 @@ def shutdown_process():
 
 # ---------------------------------------------------------------- status / studio down
 
+PURPOSE_MAX = 120  # what `acquire` keeps of a purpose; the JSON status shows all of it, the text table only 50
+
+
 def status_data(c, act, q, now):
     """The same picture as the status table, with exact epoch times, for clients that draw their own clock."""
     def when(ts):
@@ -669,10 +672,10 @@ def status_data(c, act, q, now):
         "placeDown": [{"place": pf["place_label"] or pf["name"][12:], "agent": pf["agent"], "at": when(pf["at"]),
                        "reason": pf["reason"]} for pf in place_down],
         "active": [{"place": r["place_label"], "agent": r["agent"], "lane": lane_of(r), "scope": fmt_scope(r),
-                    "purpose": one_line(r["purpose"], 50) or None, "started": r["started"] or now,
+                    "purpose": one_line(r["purpose"], PURPOSE_MAX) or None, "started": r["started"] or now,
                     "minutes": r["minutes"], "leaseUntil": r["lease_until"]} for r in act],
         "queued": [{"position": position(c, r)[0], "place": r["place_label"], "agent": r["agent"], "lane": lane_of(r),
-                    "scope": fmt_scope(r), "purpose": one_line(r["purpose"], 50) or None,
+                    "scope": fmt_scope(r), "purpose": one_line(r["purpose"], PURPOSE_MAX) or None,
                     "queued": r["queued_at"] or r["created"], "isAway": not is_live(r, now), "minutes": r["minutes"]} for r in q],
     }
 

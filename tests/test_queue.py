@@ -586,6 +586,16 @@ class Places(QueueCase):
         self.assertAlmostEqual(w["queued"], self.row("B")["queued_at"], places=3)
         self.assertIn("ACTIVE (1)", server.status({})["text"])  # the text table is unchanged
 
+    def test_status_json_keeps_the_whole_purpose_while_the_text_table_cuts_it(self):
+        long = "Checking the per-place band with a deliberately long purpose that has to be cut off cleanly"
+        self.assertGreater(len(long), 50)
+        self.acq("a", "A", place=self.SD, purpose=long)
+        data = json.loads(server.status({"format": "json"})["text"])
+        self.assertEqual(data["active"][0]["purpose"], long)  # a client that scrolls its text gets all of it
+        text = server.status({})["text"]
+        self.assertIn(long[:50], text)
+        self.assertNotIn(long[:51], text)  # the compact table is still cut at 50 characters
+
     def test_status_shows_a_dash_for_no_place(self):
         self.acq("a", "A")
         self.assertRegex(server.status({})["text"], r"  - \| a \| play")
