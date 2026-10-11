@@ -1,6 +1,6 @@
 ﻿# Roblox Playtest Queue
 
-An external MCP server (version 0.4.0) that shares Roblox Studio between several agents, with one queue per place. It does not modify or depend on the Roblox Studio MCP.
+An external MCP server (version 0.5.0) that shares Roblox Studio between several agents, with one queue per place. It does not modify or depend on the Roblox Studio MCP.
 
 Every Claude Code session spawns its own `server.py`; all of them share one sqlite database (`%LOCALAPPDATA%\RobloxPlaytestQueue\queue.db`). Subagents of one session share that session's process.
 
@@ -34,6 +34,24 @@ Each place has its own queue. Agents pass `place` to `acquire` exactly as `list_
 - Studio audio muting is process-wide, so it is muted once for all concurrent play leases and restored when the last one ends.
 - `status` lists every place with a `place` column, and queue positions count within a place.
 
+### Windows (seats)
+
+A place can be open in several Studio windows at once, for example one per Roblox account in Team Create. List them in `seats.json` (`ROBLOX_PLAYTEST_SEATS`, default `%LOCALAPPDATA%\RobloxPlaytestQueue\seats.json`), in order of preference:
+
+```json
+{"93721339261612": [{"name": "hythe44", "userId": 6202950044, "note": "the window that syncs scripts"},
+                    {"name": "hythe55", "userId": 265199502}]}
+```
+
+The key is a placeId (or a name as `list_roblox_studios` gives it). An entry is a name or an object with `name`, optional `userId` and `note`. The file is re-read when it changes. A place not listed has one window and behaves exactly as before.
+
+- Play and camera leases hold one window. Edit leases also sit in a window (one that is not playing), but edit scopes conflict across all windows of the place, because the windows share its instances.
+- `acquire` plans every live waiter in queue order: each takes the first window where nothing it conflicts with is active or planned ahead of it. A waiter with no free window waits on the one with the shortest expected wait, and moves to another as soon as that one frees first. Windows are first come, first served.
+- The grant names the window (`seat` in the result, and `Window: <name> (userId <id>)` in the text) with how to find its `studio_id`: run `return game:GetService("StudioService"):GetUserId()` in each window of the place. A "still queued" result names the window it waits on.
+- `report_down` and `report_up` take `seat` (with `place`) to take one window out of rotation, for example when it is not open. When every window of a place is down, `acquire` for that place returns `down`.
+- A lease without a window (from an old-code process, or granted before the place had seats) blocks every window of its place. Old-code processes treat every lease of a place as one window, which is safe.
+- `status` shows the window after the place (`Airship (placeId: …) / hythe55`); the JSON has `seat` on active and queued jobs.
+
 ### Ordering
 
 Grants follow queue time. A job is granted when no active lease conflicts with it and no live, earlier-queued job conflicts with it. So a play waits for earlier edits and blocks later ones, while non-overlapping edits may pass each other. A waiter counts as live while its `acquire` call is polling, and for `ROBLOX_PLAYTEST_LIVE_SECONDS` after; a waiter that is between calls longer than that keeps its place but does not hold others up.
@@ -64,8 +82,8 @@ While a play request is waiting, `renew` on an edit lease still succeeds but tel
 | `renew` | `renew(agent, job_id)` (+300 s; reports when over 150% of the estimate) |
 | `cancel` | `cancel(agent, job_id)` |
 | `status` | `status(job_id?)` compact table of active leases and the queue, ETA for `job_id` |
-| `report_down` | `report_down(agent, reason, place?)` |
-| `report_up` | `report_up(agent, place?)` |
+| `report_down` | `report_down(agent, reason, place?, seat?)` |
+| `report_up` | `report_up(agent, place?, seat?)` |
 
 Old calls `acquire(agent, job_id)` keep working (play lane, no place). Use a stable `job_id`; re-call with the same values when `acquire` says it is still queued.
 
@@ -91,6 +109,7 @@ The ETA is the sum of the remaining expected minutes of the conflicting leases a
 | `ROBLOX_PLAYTEST_AUDIO_POLL_SECONDS` | 0.5 | Mute watcher interval |
 | `ROBLOX_PLAYTEST_AUDIO_STATE` | `audio-state.json` next to `audio.py` | Saved mute state |
 | `ROBLOX_PLAYTEST_CLI_STATE` | `%LOCALAPPDATA%\RobloxPlaytestQueue\manual-lease.json` | `queue_cli.py` lease record |
+| `ROBLOX_PLAYTEST_SEATS` | `%LOCALAPPDATA%\RobloxPlaytestQueue\seats.json` | Studio windows per place (see Windows) |
 
 ## Log lines
 

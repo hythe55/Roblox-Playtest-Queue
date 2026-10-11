@@ -18,6 +18,7 @@ TMP = tempfile.mkdtemp(prefix="rpq-test-")
 os.environ["ROBLOX_PLAYTEST_QUEUE_DB"] = os.path.join(TMP, "import.db")
 os.environ["ROBLOX_PLAYTEST_QUEUE_LOG"] = os.path.join(TMP, "queue.log")
 os.environ["ROBLOX_PLAYTEST_AUDIO_STATE"] = os.path.join(TMP, "audio-state.json")
+os.environ["ROBLOX_PLAYTEST_SEATS"] = os.path.join(TMP, "no-seats.json")
 os.environ.pop("ROBLOX_PLAYTEST_MUTE_AUDIO", None)
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
@@ -61,8 +62,9 @@ class QueueCase(unittest.TestCase):
     def setUp(self):
         self._saved = {k: getattr(server, k) for k in (
             "DB", "POLL_SECONDS", "MAX_WAIT_SECONDS", "GRACE_SECONDS", "LIVE_SECONDS", "LEASE_SECONDS",
-            "CAMERA_SECONDS", "PROCESS_TIMEOUT_SECONDS", "QUEUE_WAIT_SECONDS")}
+            "CAMERA_SECONDS", "PROCESS_TIMEOUT_SECONDS", "QUEUE_WAIT_SECONDS", "SEATS_FILE")}
         server.DB = os.path.join(TMP, self.id().split(".")[-1] + ".db")
+        server.SEATS_FILE = os.path.join(TMP, self.id().split(".")[-1] + "-seats.json")  # absent: one window per place
         server.POLL_SECONDS = 0.03
         server.MAX_WAIT_SECONDS = 0.25
         server.GRACE_SECONDS = 60
@@ -651,6 +653,88 @@ class Places(QueueCase):
         self.assertEqual(calls, [("mute", "A"), ("restore", "A")])  # the job that muted holds the saved state
 
 
+class Seats(QueueCase):
+    AIR = "Airship (placeId: 555)"
+
+    def setUp(self):
+        super().setUp()
+        with open(server.SEATS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"555": [{"name": "w1", "userId": 11, "note": "syncs scripts"}, "w2"]}, f)
+
+    def test_a_second_play_gets_the_other_window(self):
+        a = self.acq("a", "A", place=self.AIR)
+        b = self.acq("b", "B", place=self.AIR)
+        self.assertEqual((a["status"], a["seat"], b["status"], b["seat"]), ("granted", "w1", "granted", "w2"))
+        c = self.acq("c", "C", place=self.AIR)
+        self.assertEqual(c["status"], "queued")
+        self.assertIn("Waiting on window", c["text"])
+
+    def test_grant_names_the_window_and_how_to_find_it(self):
+        r = self.acq("a", "A", place=self.AIR)
+        self.assertIn("Window: w1 (userId 11), syncs scripts.", r["text"])
+        self.assertIn("GetUserId", r["text"])
+        self.assertIn("  Airship (placeId: 555) / w1 | a | play", server.status({})["text"])
+        self.assertEqual(json.loads(server.status({"format": "json"})["text"])["active"][0]["seat"], "w1")
+        self.assertRegex(self.log(), r"INFO acquire job=A agent=a lane=play .* seat=w1")
+
+    def test_a_waiter_takes_whichever_window_frees_first(self):
+        self.acq("a", "A", place=self.AIR, minutes=1)
+        self.acq("b", "B", place=self.AIR, minutes=30)
+        c = self.bg("c", "C", place=self.AIR)
+        wait_for(lambda: self.row("C")["seat"] == "w1")  # shortest expected wait
+        self.rel("b", "B")
+        r = c.get()
+        self.assertEqual((r["status"], r["seat"]), ("granted", "w2"))
+
+    def test_windows_are_first_come_first_served(self):
+        self.acq("a", "A", place=self.AIR)
+        self.acq("b", "B", place=self.AIR)
+        c = self.bg("c", "C", place=self.AIR)
+        d = self.bg("d", "D", place=self.AIR)
+        self.rel("b", "B")
+        self.assertEqual(c.get()["seat"], "w2")
+        self.assertEqual(self.state("D"), "queued")
+        self.rel("a", "A")
+        self.assertEqual(d.get()["seat"], "w1")
+
+    def test_a_play_takes_a_window_without_edits(self):
+        e = self.acq("e", "E", place=self.AIR, lane="edit", scope=["Workspace.Map"])
+        p = self.acq("p", "P", place=self.AIR)
+        self.assertEqual((e["seat"], p["status"], p["seat"]), ("w1", "granted", "w2"))
+        self.assertFalse(server.renew({"agent": "e", "job_id": "E"})["yield"])  # nobody waits on w1
+
+    def test_edit_scopes_conflict_across_windows(self):
+        self.acq("p", "P", place=self.AIR)  # w1 plays
+        self.assertEqual(self.acq("a", "A", place=self.AIR, lane="edit", scope=["Workspace.Map"])["seat"], "w2")
+        self.assertEqual(self.acq("b", "B", place=self.AIR, lane="edit", scope=["Workspace.Map.Tower"])["status"], "queued")
+        self.assertEqual(self.acq("c", "C", place=self.AIR, lane="edit", scope=["StarterGui"])["status"], "granted")
+
+    def test_a_window_reported_down_is_skipped(self):
+        server.report_down({"agent": "x", "reason": "not open", "place": self.AIR, "seat": "W1"})
+        self.assertIn("Window down: " + self.AIR + " / W1", server.status({})["text"])
+        self.assertEqual(self.acq("a", "A", place=self.AIR)["seat"], "w2")
+        self.assertEqual(self.acq("b", "B", place=self.AIR)["status"], "queued")
+        server.report_down({"agent": "x", "reason": "not open", "place": self.AIR, "seat": "w2"})
+        r = self.acq("c", "C", place=self.AIR)
+        self.assertEqual(r["status"], "down")
+        self.assertIn("Every Studio window of place", r["text"])
+        server.report_up({"agent": "x", "place": self.AIR, "seat": "w1"})
+        self.assertEqual(self.acq("d", "D", place=self.AIR)["seat"], "w1")
+        with self.assertRaises(ValueError):
+            server.report_down({"agent": "x", "reason": "r", "seat": "w1"})  # a seat needs its place
+
+    def test_a_lease_without_a_window_blocks_every_window(self):
+        now = time.time()
+        self.c.execute("INSERT INTO jobs(id,agent,state,created,started,lease_until,lane,place) VALUES('OLD','old','active',?,?,?,'play','555')",
+                       (now, now, now + 60))
+        self.assertEqual(self.acq("a", "A", place=self.AIR)["status"], "queued")
+
+    def test_other_places_keep_one_window(self):
+        sd = "SD (placeId: 91199332916924)"
+        self.assertIsNone(self.acq("a", "A", place=sd)["seat"])
+        self.assertEqual(self.acq("b", "B", place=sd)["status"], "queued")
+
+
 class Migration(unittest.TestCase):
     def test_old_schema_db_migrates_additively(self):
         path = os.path.join(TMP, "old-schema.db")
@@ -712,7 +796,7 @@ class EndToEnd(unittest.TestCase):
 
         try:
             init = rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
-            self.assertEqual(init["serverInfo"]["version"], "0.4.0")
+            self.assertEqual(init["serverInfo"]["version"], server.VERSION)
             self.assertIn("requesting a position in the Roblox Studio queue", init["instructions"])
             p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); p.stdin.flush()
             names = [t["name"] for t in rpc("tools/list")["tools"]]

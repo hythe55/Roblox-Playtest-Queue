@@ -9,7 +9,7 @@ import json, logging, os, re, sqlite3, sys, threading, time, uuid
 from contextlib import contextmanager
 from audio import mute_studio, restore_studio
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def _env(name, default):
@@ -22,6 +22,7 @@ def _env(name, default):
 DEFAULT_DB_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "RobloxPlaytestQueue")
 DB = os.environ.get("ROBLOX_PLAYTEST_QUEUE_DB", os.path.join(DEFAULT_DB_DIR, "queue.db"))
 LOG_FILE = os.environ.get("ROBLOX_PLAYTEST_QUEUE_LOG", os.path.join(os.path.dirname(__file__), "queue.log"))
+SEATS_FILE = os.environ.get("ROBLOX_PLAYTEST_SEATS", os.path.join(DEFAULT_DB_DIR, "seats.json"))  # Studio windows per place
 LEASE_SECONDS = _env("ROBLOX_PLAYTEST_LEASE_SECONDS", 300)        # play / edit lease and renew length
 CAMERA_SECONDS = _env("ROBLOX_PLAYTEST_CAMERA_SECONDS", 120)      # camera lease, capped at 120, not renewable
 QUEUE_WAIT_SECONDS = _env("ROBLOX_PLAYTEST_QUEUE_WAIT_SECONDS", 3600)  # old-code queued jobs older than this expire
@@ -62,7 +63,7 @@ class Ctx:
 
 NEW_JOB_COLUMNS = [("lane", "TEXT"), ("scope", "TEXT"), ("purpose", "TEXT"), ("minutes", "REAL"),
                    ("proc", "TEXT"), ("last_seen", "REAL"), ("queued_at", "REAL"), ("notes", "TEXT"),
-                   ("rejoin_until", "REAL"), ("place", "TEXT"), ("place_label", "TEXT")]
+                   ("rejoin_until", "REAL"), ("place", "TEXT"), ("place_label", "TEXT"), ("seat", "TEXT")]
 
 
 def migrate(c):
@@ -200,6 +201,80 @@ def same_place(a, b):
     return pa is None or pb is None or pa == pb
 
 
+# ---------------------------------------------------------------- seats (several Studio windows on one place)
+
+_seats_cache = {"key": None, "data": {}}
+
+
+def load_seats():
+    """`{place key: [{"name", "label"}]}` from SEATS_FILE. A place not listed has one implicit seat (None).
+
+    The file maps a place (a placeId, or a name as list_roblox_studios gives it) to its Studio windows, in order of
+    preference: `{"93721339261612": [{"name": "hythe44", "userId": 6202950044, "note": "syncs scripts"}, "hythe55"]}`.
+    It is re-read when it changes.
+    """
+    try:
+        key = (SEATS_FILE, os.path.getmtime(SEATS_FILE))
+    except OSError:
+        return {}
+    if _seats_cache["key"] == key:
+        return _seats_cache["data"]
+    try:
+        with open(SEATS_FILE, encoding="utf-8-sig") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        logging.exception("cannot read seats file %s", SEATS_FILE)
+        return {}
+    out = {}
+    for place, seats in raw.items() if isinstance(raw, dict) else []:
+        pkey, _ = parse_place(str(place))
+        lst = []
+        for s in seats if isinstance(seats, list) else []:
+            if isinstance(s, str):
+                s = {"name": s}
+            if not isinstance(s, dict) or not one_line(str(s.get("name") or ""), 60):
+                continue
+            name = one_line(str(s["name"]), 60)
+            label = name + (f" (userId {s['userId']})" if s.get("userId") else "")
+            if s.get("note"):
+                label += f", {one_line(str(s['note']), 80)}"
+            if name.casefold() not in [x["name"].casefold() for x in lst]:
+                lst.append({"name": name, "label": label})
+        if pkey and lst:
+            out[pkey] = lst
+    _seats_cache.update(key=key, data=out)
+    return out
+
+
+def seat_flag(place, seat):
+    return f"studio_down:{place}#{seat.casefold()}"
+
+
+def seats_for(c, place):
+    """Seats a job for `place` may use: its configured windows not reported down; [None] for a one-window place.
+
+    An empty list means every window of the place is down.
+    """
+    conf = load_seats().get(place) if place is not None else None
+    if not conf:
+        return [None]
+    down = {r["name"] for r in c.execute("SELECT name FROM flags WHERE substr(name,1,?)=?",
+                                         (len(f"studio_down:{place}#"), f"studio_down:{place}#"))}
+    return [s["name"] for s in conf if seat_flag(place, s["name"]) not in down]
+
+
+def seat_label(place, seat):
+    for s in load_seats().get(place) or []:
+        if s["name"].casefold() == (seat or "").casefold():
+            return s["label"]
+    return seat
+
+
+def same_seat(a, b):
+    sa, sb = a["seat"], b["seat"]
+    return sa is None or sb is None or sa.casefold() == sb.casefold()
+
+
 def paths_overlap(a, b):
     a, b = a.casefold(), b.casefold()
     return a == b or b.startswith(a + ".") or a.startswith(b + ".")
@@ -215,12 +290,14 @@ def conflicts(a, b):
     if not same_place(a, b):
         return False  # queues are per place; a job with no place is the exception and conflicts with every place
     la, lb = lane_of(a), lane_of(b)
+    if la == "edit" and lb == "edit":
+        return scopes_overlap(scope_of(a), scope_of(b))  # windows of one place share its instances
+    if not same_seat(a, b):
+        return False  # play and camera hold one window; another window of the place is free
     if la == "play" or lb == "play":
         return True
     if la == "camera" and lb == "camera":
         return True
-    if la == "edit" and lb == "edit":
-        return scopes_overlap(scope_of(a), scope_of(b))
     return False  # camera vs edit
 
 
@@ -241,11 +318,63 @@ def queued_rows(c):
 
 
 def blockers_for(c, row, now):
-    """Active leases that conflict with `row`, and live earlier-queued jobs that conflict with it."""
+    """Active leases that conflict with `row`, and live earlier-queued jobs that conflict with it (stored seats)."""
     act = [a for a in active_rows(c, now) if a["id"] != row["id"] and conflicts(a, row)]
     ahead = [q for q in queued_rows(c) if q["id"] != row["id"] and order_key(q) < order_key(row)
              and is_live(q, now) and conflicts(q, row)]
     return act, ahead
+
+
+def as_dict(r):
+    return dict(zip(r.keys(), tuple(r)))
+
+
+def wait_minutes(blockers, now):
+    """Expected minutes until `blockers` are done; a blocker without an estimate counts as one lease."""
+    total = 0.0
+    for b in blockers:
+        m = b["minutes"] if b["minutes"] is not None else LEASE_SECONDS / 60
+        total += max(0.0, m - (now - (b["started"] or now)) / 60) if b["state"] == "active" else m
+    return total
+
+
+def plan(c, now):
+    """What every live waiter would get now, in queue order: `{job_id: (grant, seat, blockers)}`.
+
+    Active leases hold their seats. Each waiter takes the first seat of its place where nothing it conflicts with is
+    active or planned ahead of it. If none is free it waits on the seat with the shortest expected wait and holds up
+    later requests that conflict with it there; on the next poll it moves to whichever seat frees first. Every process
+    plans from the same rows, so they agree, and a job is still only granted by its own polling thread. A place with
+    one window plans exactly as before seats existed.
+    """
+    held = [as_dict(a) for a in active_rows(c, now)]
+    seats_by_place = {}
+    out = {}
+    for q in queued_rows(c):
+        if not is_live(q, now):
+            continue
+        if q["place"] not in seats_by_place:
+            seats_by_place[q["place"]] = seats_for(c, q["place"])
+        seats = seats_by_place[q["place"]]
+        if not seats:
+            out[q["id"]] = (False, None, [])  # every window of the place is down
+            continue
+        job = as_dict(q)
+        best = None
+        for s in seats:
+            job["seat"] = s
+            blockers = [h for h in held if h["id"] != job["id"] and conflicts(job, h)]
+            if not blockers:
+                out[q["id"]] = (True, s, [])
+                break
+            w = wait_minutes(blockers, now)
+            if best is None or w < best[0]:
+                best = (w, s, blockers)
+        else:
+            job["seat"] = best[1]
+            out[q["id"]] = (False, best[1], best[2])
+        held.append(job)
+    return out
 
 
 def fmt_dur(s):
@@ -267,20 +396,28 @@ def one_line(s, n=120):
 
 def log_fields(r):
     base = f"lane={lane_of(r)} scope={fmt_scope(r)} purpose={one_line(r['purpose'], 80) or '-'}"
-    return base + (f" place={r['place_label']}" if r["place_label"] else "")
+    return base + (f" place={r['place_label']}" if r["place_label"] else "") + (f" seat={r['seat']}" if r["seat"] else "")
 
 
-def fmt_eta(c, row, now):
-    act, ahead = blockers_for(c, row, now)
-    if not act and not ahead:
+def fmt_place(r):
+    """The place column: the place label, and the window for a place with several."""
+    return (r["place_label"] or "-") + (f" / {r['seat']}" if r["seat"] else "")
+
+
+def eta_text(blockers, now):
+    if not blockers:
         return "next poll"
-    total = 0.0
-    for b in act + ahead:
-        m = b["minutes"]
-        if m is None:
-            return "unknown"
-        total += max(0.0, m - (now - (b["started"] or now)) / 60) if b["state"] == "active" else m
-    return f"~{max(1, round(total))} min"
+    if any(b["minutes"] is None for b in blockers):
+        return "unknown"
+    return f"~{max(1, round(wait_minutes(blockers, now)))} min"
+
+
+def fmt_eta(c, row, now, planned=None):
+    p = (planned if planned is not None else plan(c, now)).get(row["id"])
+    if p is not None:
+        return eta_text(p[2], now)
+    act, ahead = blockers_for(c, row, now)  # an away waiter is not planned
+    return eta_text(act + ahead, now)
 
 
 def position(c, row):
@@ -416,6 +553,8 @@ def granted(c, row, now):
     parts = [f"Ready. Use the same agent and job_id={row['id']} when releasing or renewing. "
              f"lane={lane}{'' if lane != 'edit' else ' scope=' + fmt_scope(row)}"
              f"{' place=' + row['place_label'] if row['place_label'] else ''} lease={row['lease_until'] - now:.0f}s."]
+    if row["seat"]:
+        parts.append(f"Window: {seat_label(row['place'], row['seat'])}. {WINDOW_HELP}")
     if lane == "camera":
         parts.append("Camera lease is short and not renewable; release as soon as the capture is done.")
     elif lane == "edit":
@@ -428,8 +567,19 @@ def granted(c, row, now):
         parts.append("Before starting, make sure Studio is stopped and in the state your project's docs require.")
     note = holding_note(c, row["agent"], row["id"], now)
     if note: parts.append(note.strip())
-    return {"status": "granted", "job_id": row["id"], "lease_id": row["id"], "lane": lane,
+    return {"status": "granted", "job_id": row["id"], "lease_id": row["id"], "lane": lane, "seat": row["seat"],
             "expires_at": row["lease_until"], "lease_seconds": row["lease_until"] - now, "text": " ".join(parts)}
+
+
+WINDOW_HELP = ("Several Studio windows share this place: act only in this one, and pass its studio_id to every Studio tool. "
+               "To find it, call list_roblox_studios, then execute_luau `return game:GetService(\"StudioService\"):GetUserId()` "
+               "on each window of the place and take the one with this userId. If it is not open, release, call report_down "
+               "with place and seat set to the window name, and acquire again.")
+
+
+def windows_down_text(place_label):
+    return (f"Every Studio window of place {place_label} is reported down. Stop and tell your orchestrator or user; "
+            "report_up with place and seat brings a window back.")
 
 
 def _drop_cancelled(agent, job_id):
@@ -472,13 +622,17 @@ def acquire(args, ctx=None):
                 row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if row is not None and row["agent"] != agent:
                     raise ValueError(f"job_id={job_id} belongs to another agent; use a unique job_id")
-                down = down_flag(c, row["place"] if row is not None else place_key)
-                if down and not (row and row["state"] == "active"):
+                jp = row["place"] if row is not None else place_key
+                down = down_flag(c, jp)
+                text = down_text(down) if down else None
+                if text is None and not seats_for(c, jp):
+                    text = windows_down_text((row["place_label"] if row is not None else None) or place_label or jp)
+                if text and not (row and row["state"] == "active"):
                     if row and row["state"] == "queued":
                         end_job(row, "cancelled", now, events, restore, c, "studio-down", "cancel")
-                    result = {"status": "down", "job_id": job_id, "text": down_text(down)}
-                elif down:
-                    result = {"status": "down", "job_id": job_id, "text": down_text(down) + " Your current lease continues; finish and release it."}
+                    result = {"status": "down", "job_id": job_id, "text": text}
+                elif text:
+                    result = {"status": "down", "job_id": job_id, "text": text + " Your current lease continues; finish and release it."}
                 if result is None and row is None:
                     if not first: raise ValueError("job not found")
                     for old in c.execute("SELECT * FROM jobs WHERE agent=? AND state='queued'", (agent,)).fetchall():
@@ -511,9 +665,11 @@ def acquire(args, ctx=None):
                         result = {"status": st, "job_id": job_id, "text": f"{msgs.get(st, st)} job_id={job_id}. Use a new job_id to queue again."}
                     else:
                         c.execute("UPDATE jobs SET last_seen=? WHERE id=?", (now, job_id))
+                        planned = plan(c, now)
+                        ok, seat, _ = planned.get(job_id, (False, None, []))
+                        c.execute("UPDATE jobs SET seat=? WHERE id=?", (seat, job_id))  # the window it waits on, for status
                         row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-                        act, ahead = blockers_for(c, row, now)
-                        if not act and not ahead:
+                        if ok:
                             secs = min(CAMERA_SECONDS, MAX_CAMERA_SECONDS) if lane_of(row) == "camera" else LEASE_SECONDS
                             c.execute("UPDATE jobs SET state='active',started=?,lease_until=? WHERE id=? AND state='queued'",
                                       (now, now + secs, job_id))
@@ -526,9 +682,11 @@ def acquire(args, ctx=None):
                             events.append((logging.INFO, f"acquire job={job_id} agent={agent} {log_fields(row)}"))
                         elif time.monotonic() >= deadline:
                             pos, total = position(c, row)
-                            eta = fmt_eta(c, row, now)
-                            result = {"status": "queued", "job_id": job_id, "position": pos, "queued": total, "eta": eta,
-                                      "text": (f"Still queued (not an error): position {pos} of {total}, ETA {eta}. "
+                            eta = fmt_eta(c, row, now, planned)
+                            where = (f" Waiting on window {seat_label(row['place'], seat)}; you move to another window of the "
+                                     "place if one frees first." if seat else "")
+                            result = {"status": "queued", "job_id": job_id, "position": pos, "queued": total, "eta": eta, "seat": seat,
+                                      "text": (f"Still queued (not an error): position {pos} of {total}, ETA {eta}.{where} "
                                                f"Call acquire again now with the same agent and job_id={job_id} "
                                                f"(your place is kept for {GRACE_SECONDS:.0f}s)." + holding_note(c, agent, job_id, now))}
             flush([e for e in events if not e[1].startswith("acquire ")], restore)
@@ -596,7 +754,7 @@ def renew(args):
                 raise ValueError("camera leases are not renewable; release and acquire again")
             waiting = [q for q in queued_rows(c) if is_live(q, now) and conflicts(q, row)]
             if lane == "edit":
-                plays = [q for q in queued_rows(c) if is_live(q, now) and lane_of(q) == "play" and same_place(q, row)]
+                plays = [q for q in queued_rows(c) if is_live(q, now) and lane_of(q) == "play" and conflicts(q, row)]
                 if plays:
                     waited = now - (plays[0]["queued_at"] or plays[0]["created"])
                     if waited > LEASE_SECONDS:
@@ -671,10 +829,10 @@ def status_data(c, act, q, now):
         "down": {"agent": f["agent"], "at": when(f["at"]), "reason": f["reason"]} if f else None,
         "placeDown": [{"place": pf["place_label"] or pf["name"][12:], "agent": pf["agent"], "at": when(pf["at"]),
                        "reason": pf["reason"]} for pf in place_down],
-        "active": [{"place": r["place_label"], "agent": r["agent"], "lane": lane_of(r), "scope": fmt_scope(r),
+        "active": [{"place": r["place_label"], "seat": r["seat"], "agent": r["agent"], "lane": lane_of(r), "scope": fmt_scope(r),
                     "purpose": one_line(r["purpose"], PURPOSE_MAX) or None, "started": r["started"] or now,
                     "minutes": r["minutes"], "leaseUntil": r["lease_until"]} for r in act],
-        "queued": [{"position": position(c, r)[0], "place": r["place_label"], "agent": r["agent"], "lane": lane_of(r),
+        "queued": [{"position": position(c, r)[0], "place": r["place_label"], "seat": r["seat"], "agent": r["agent"], "lane": lane_of(r),
                     "scope": fmt_scope(r), "purpose": one_line(r["purpose"], PURPOSE_MAX) or None,
                     "queued": r["queued_at"] or r["created"], "isAway": not is_live(r, now), "minutes": r["minutes"]} for r in q],
     }
@@ -692,16 +850,16 @@ def status(args):
         f = down_flag(c)
         lines = [f"Studio: DOWN, reported by {f['agent']} at {time.strftime('%H:%M', time.localtime(f['at']))}: {f['reason']}" if f else "Studio: up"]
         for pf in c.execute("SELECT * FROM flags WHERE substr(name,1,12)='studio_down:' ORDER BY at").fetchall():
-            lines.append(f"Place down: {pf['place_label'] or pf['name'][12:]}, reported by {pf['agent']} at "
-                         f"{time.strftime('%H:%M', time.localtime(pf['at']))}: {pf['reason']}")
+            lines.append(f"{'Window' if '#' in pf['name'] else 'Place'} down: {pf['place_label'] or pf['name'][12:]}, reported by "
+                         f"{pf['agent']} at {time.strftime('%H:%M', time.localtime(pf['at']))}: {pf['reason']}")
         lines.append(f"ACTIVE ({len(act)}): place | agent | lane | scope | purpose | age | expected")
         for r in act:
             exp = f"{r['minutes']:g}m" if r["minutes"] else "?"
-            lines.append(f"  {r['place_label'] or '-'} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['started'] or now))} | {exp}")
+            lines.append(f"  {fmt_place(r)} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['started'] or now))} | {exp}")
         lines.append(f"QUEUED ({len(q)}): # | place | agent | lane | scope | purpose | waited")
         for r in q:
             away = "" if is_live(r, now) else " (away)"
-            lines.append(f"  {position(c, r)[0]} | {r['place_label'] or '-'} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['queued_at'] or r['created']))}{away}")
+            lines.append(f"  {position(c, r)[0]} | {fmt_place(r)} | {r['agent']} | {lane_of(r)} | {fmt_scope(r)} | {one_line(r['purpose'], 50) or '-'} | {fmt_dur(now - (r['queued_at'] or r['created']))}{away}")
         jid = args.get("job_id")
         if isinstance(jid, str) and jid:
             r = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
@@ -719,21 +877,36 @@ def status(args):
         c.close()
 
 
+def parse_seat(args, key):
+    seat = one_line(args.get("seat") if isinstance(args.get("seat"), str) else "", 60) or None
+    if seat and key is None:
+        raise ValueError("seat needs place: the window name and the place it shows")
+    return seat
+
+
+def flag_name(key, seat):
+    return "studio_down" if key is None else seat_flag(key, seat) if seat else "studio_down:" + key
+
+
 def report_down(args):
     agent = need_str(args, "agent", "report_down")
     reason = one_line(args.get("reason"), 300) or "no reason given"
     key, label = parse_place(args.get("place"))
+    seat = parse_seat(args, key)
     c = db()
     try:
         with txn(c):
             c.execute("INSERT INTO flags(name,agent,reason,at,place_label) VALUES(?,?,?,?,?) "
                       "ON CONFLICT(name) DO UPDATE SET agent=excluded.agent, reason=excluded.reason, at=excluded.at, "
                       "place_label=excluded.place_label",
-                      ("studio_down" if key is None else "studio_down:" + key, agent, reason, time.time(), label))
+                      (flag_name(key, seat), agent, reason, time.time(), f"{label} / {seat}" if seat else label))
     finally:
         c.close()
-    logging.warning("studio down by=%s reason=%s%s", agent, reason, f" place={label}" if label else "")
+    logging.warning("studio down by=%s reason=%s%s%s", agent, reason, f" place={label}" if label else "", f" seat={seat}" if seat else "")
     wake_all()
+    if seat:
+        return {"text": (f"Window {seat} of place {label} marked down. Requests for that place use its other windows until "
+                         "someone calls report_up with the same place and seat. Tell your orchestrator or user.")}
     if key is None:
         return {"text": "Studio marked down. Every acquire returns immediately until someone calls report_up. Stop and tell your orchestrator or user."}
     return {"text": (f"Studio place {label} marked down. Every acquire for that place returns immediately until someone calls report_up "
@@ -743,24 +916,27 @@ def report_down(args):
 def report_up(args):
     agent = need_str(args, "agent", "report_up")
     key, label = parse_place(args.get("place"))
+    seat = parse_seat(args, key)
     c = db()
     try:
         with txn(c):
-            had = c.execute("DELETE FROM flags WHERE name=?", ("studio_down" if key is None else "studio_down:" + key,)).rowcount
+            had = c.execute("DELETE FROM flags WHERE name=?", (flag_name(key, seat),)).rowcount
     finally:
         c.close()
-    logging.info("studio up by=%s was_down=%s%s", agent, bool(had), f" place={label}" if label else "")
-    what = "Studio" if key is None else f"Studio place {label}"
+    logging.info("studio up by=%s was_down=%s%s%s", agent, bool(had), f" place={label}" if label else "", f" seat={seat}" if seat else "")
+    wake_all()
+    what = "Studio" if key is None else f"Window {seat} of place {label}" if seat else f"Studio place {label}"
     return {"text": f"{what} marked up." if had else f"{what} was not marked down."}
 
 
 # ---------------------------------------------------------------- MCP plumbing
 
 PLACE = {"type": "string", "description": "The Studio place, exactly as list_roblox_studios names it. Omit for every place."}
+SEAT = {"type": "string", "description": "One window of a place with several (the window name a grant gave). Needs place."}
 JOB = {"agent": {"type": "string", "description": "Your stable agent name."},
        "job_id": {"type": "string", "description": "Stable id for this request; reuse it for every call about it."}}
 TOOLS = [
- {"name": "acquire", "description": "Get a lease before any blocking Studio action: Play mode, screenshots, camera/input (lane play, default, exclusive); MCP edits to instances (lane edit, concurrent with other edits unless scopes overlap); or a short screenshot/viewport change during edit work (lane camera, max 120 s). Reads (search, inspect, script reads) and filesystem script edits need no lease. Queues are per Studio place: pass `place` exactly as list_roblox_studios names the Studio you will act on (e.g. 'SD (placeId: 91199332916924)'); jobs for different places never wait for each other, and a job without `place` waits for every place. Unless the user asks to bypass the queue, tell the user you are requesting a queue position first. Waits up to ~4.5 min; if it says 'still queued', call again at once with the same agent and job_id. Lease is 300 s; renew, release when done.",
+ {"name": "acquire", "description": "Get a lease before any blocking Studio action: Play mode, screenshots, camera/input (lane play, default, exclusive); MCP edits to instances (lane edit, concurrent with other edits unless scopes overlap); or a short screenshot/viewport change during edit work (lane camera, max 120 s). Reads (search, inspect, script reads) and filesystem script edits need no lease. Queues are per Studio place: pass `place` exactly as list_roblox_studios names the Studio you will act on (e.g. 'SD (placeId: 91199332916924)'); jobs for different places never wait for each other, and a job without `place` waits for every place. A place can have several Studio windows: the grant then names your window (seat); act only in that one. Unless the user asks to bypass the queue, tell the user you are requesting a queue position first. Waits up to ~4.5 min; if it says 'still queued', call again at once with the same agent and job_id. Lease is 300 s; renew, release when done.",
   "inputSchema": {"type": "object", "properties": {**JOB,
      "place": {"type": "string", "description": "The Studio place you act on, exactly as list_roblox_studios names it, e.g. \"SD (placeId: 91199332916924)\". Each place has its own queue."},
      "lane": {"type": "string", "enum": list(LANES), "description": "play (default), edit or camera."},
@@ -777,10 +953,10 @@ TOOLS = [
   "inputSchema": {"type": "object", "properties": JOB, "required": ["agent", "job_id"]}},
  {"name": "status", "description": "Show who holds Studio in each place (lane, scope, purpose, age), the queues, and an ETA for your job_id if given. No lease needed. format 'json' returns the same data as JSON with exact epoch times, for tools that draw their own clock.",
   "inputSchema": {"type": "object", "properties": {"job_id": JOB["job_id"], "format": {"type": "string", "enum": ["text", "json"], "description": "text (default) or json."}}}},
- {"name": "report_down", "description": "Call when Studio or its MCP is disconnected or unusable. Makes every acquire (for `place` when given, else for every place) return at once telling agents to stop. Do not keep retrying.",
-  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "reason": {"type": "string"}, "place": PLACE}, "required": ["agent", "reason"]}},
- {"name": "report_up", "description": "Clear the Studio-down flag once Studio is working again; pass the same `place` you gave report_down.",
-  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "place": PLACE}, "required": ["agent"]}},
+ {"name": "report_down", "description": "Call when Studio or its MCP is disconnected or unusable. Makes every acquire (for `place` when given, else for every place) return at once telling agents to stop. With `seat` as well, only that window of the place is taken out and its other windows keep working (use it when the window a grant named is not open). Do not keep retrying.",
+  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "reason": {"type": "string"}, "place": PLACE, "seat": SEAT}, "required": ["agent", "reason"]}},
+ {"name": "report_up", "description": "Clear the Studio-down flag once Studio is working again; pass the same `place` (and `seat`) you gave report_down.",
+  "inputSchema": {"type": "object", "properties": {"agent": JOB["agent"], "place": PLACE, "seat": SEAT}, "required": ["agent"]}},
 ]
 HANDLERS = {"release": release, "renew": renew, "cancel": cancel, "status": status,
             "report_down": report_down, "report_up": report_up}
@@ -795,7 +971,10 @@ INSTRUCTIONS = (
     "Queues are per place: call list_roblox_studios and pass place = the exact name listed for the Studio you act on, in acquire "
     "(and in report_down/report_up when only that place is down); jobs for different places never wait for each other, "
     "and a job without place waits for every place. "
-    "Give purpose and minutes. Use the same agent and job_id for acquire, renew, release and cancel. "
+    "A place can have several Studio windows (seats): acquire then gives you whichever window frees first, and the grant "
+    "names it; act only in that window, by its studio_id. If it is not open, release, report_down with place and seat, "
+    "and acquire again. "
+    "Give purpose and minutes.Use the same agent and job_id for acquire, renew, release and cancel. "
     "If acquire says 'still queued' it is not an error: call it again at once with the same values. "
     "Do not hold a lease while coding between runs: release (rejoin_seconds keeps your place) and acquire again. "
     "Release as soon as done and put Studio in a clean state. If Studio is down, call report_down and stop.")
