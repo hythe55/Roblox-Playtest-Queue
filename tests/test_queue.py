@@ -638,6 +638,14 @@ class Places(QueueCase):
         server.report_down({"agent": "x", "reason": "crashed", "place": self.SD})
         self.assertEqual(waiter.get()["status"], "down")
 
+    def test_play_grant_shows_only_notes_from_its_own_place(self):
+        self.acq("a", "A", place=self.HO)
+        self.rel("a", "A", notes="hotel lobby camera moved")
+        r = self.acq("b", "B", place=self.SD)
+        self.assertNotIn("left notes", r["text"])  # another place's holder never held this one
+        self.rel("b", "B", notes="sd state clean")
+        self.assertIn("left notes: sd state clean", self.acq("c", "C", place=self.SD)["text"])
+
     def test_audio_is_muted_once_and_restored_by_the_last_play_lease(self):
         calls = []
         original = (server.mute_studio, server.restore_studio)
@@ -722,6 +730,15 @@ class Seats(QueueCase):
         self.assertEqual(self.acq("d", "D", place=self.AIR)["seat"], "w1")
         with self.assertRaises(ValueError):
             server.report_down({"agent": "x", "reason": "r", "seat": "w1"})  # a seat needs its place
+
+    def test_play_grant_shows_only_notes_from_its_own_window(self):
+        self.acq("a", "A", place=self.AIR)
+        self.acq("b", "B", place=self.AIR)
+        self.rel("a", "A", notes="w1 left paused")
+        self.rel("b", "B", notes="w2 clean")
+        r = self.acq("c", "C", place=self.AIR)
+        self.assertEqual(r["seat"], "w1")
+        self.assertIn("left notes: w1 left paused", r["text"])
 
     def test_a_lease_without_a_window_blocks_every_window(self):
         now = time.time()

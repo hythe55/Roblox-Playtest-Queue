@@ -560,8 +560,10 @@ def granted(c, row, now):
     elif lane == "edit":
         parts.append("Stay inside your scope. Renew before expiry; if renew says a play request is waiting, release at the next safe point.")
     if lane == "play":
-        n = c.execute("SELECT * FROM jobs WHERE notes IS NOT NULL AND notes != '' AND agent != ? AND released >= ? "
-                      "ORDER BY released DESC LIMIT 1", (row["agent"], now - NOTES_WINDOW_SECONDS)).fetchone()
+        # only notes about the same place and window: another place's notes read as someone having held this one
+        n = next((r for r in c.execute("SELECT * FROM jobs WHERE notes IS NOT NULL AND notes != '' AND agent != ? AND released >= ? "
+                                       "ORDER BY released DESC", (row["agent"], now - NOTES_WINDOW_SECONDS))
+                  if same_place(r, row) and same_seat(r, row)), None)
         if n:
             parts.append(f"Previous holder {n['agent']} ({lane_of(n)}, {fmt_dur(now - n['released'])} ago) left notes: {n['notes']}")
         parts.append("Before starting, make sure Studio is stopped and in the state your project's docs require.")

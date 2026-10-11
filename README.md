@@ -70,7 +70,7 @@ While a play request is waiting, `renew` on an edit lease still succeeds but tel
 - `cancel` drops a queued job or releases an active one. The server also handles MCP `notifications/cancelled` and cancels the matching in-flight `acquire`.
 - Each process heartbeats every `ROBLOX_PLAYTEST_HEARTBEAT_SECONDS`. Jobs of a process not seen for `ROBLOX_PLAYTEST_PROCESS_TIMEOUT_SECONDS` are expired (audio restored for active ones). On stdin EOF a process releases and cancels its own jobs before exiting.
 - `release` with `rejoin_seconds` (0-300) lets the same agent queue as of the moment it released if it acquires again within that window: ahead of requests made while it was away, never ahead of one that was already waiting. It reserves nothing meanwhile.
-- `release` with `notes` records the state Studio was left in. A play grant shows the latest other agent's notes from the last 30 minutes.
+- `release` with `notes` records the state Studio was left in. A play grant shows the latest notes another agent left in the last 30 minutes on the same place and window.
 - `report_down` sets a global flag; while set, every `acquire` (including waiting ones) returns at once telling the agent to stop. Active leases continue. `report_up` clears it.
 
 ## Tools
